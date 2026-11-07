@@ -1,0 +1,6 @@
+{
+  "name": "SkyPulse Tactical Flight Radar & AI Copilot",
+  "description": "Real-time global flight tracking on a tactical dark radar with live telemetry, delay analytics, and an interactive Gemini AI assistant.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

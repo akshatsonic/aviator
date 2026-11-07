@@ -1,0 +1,424 @@
+import React, { useState, useRef, useEffect } from 'react';
+import { Flight, ChatMessage } from '../types/flight.ts';
+import { TimezoneCode, convertUtcTimeString } from '../utils/time.ts';
+import { MarkdownView } from './MarkdownView.tsx';
+import { Sparkles, Send, X, Crosshair, ArrowUpRight, Plane, Loader2, RotateCcw, ChevronDown, ChevronUp } from 'lucide-react';
+
+interface AIFlightAssistantDrawerProps {
+  isOpen: boolean;
+  onClose: () => void;
+  flights: Flight[];
+  onFocusFlight: (flightId: string) => void;
+  prefilledQuery?: string;
+  onClearPrefill?: () => void;
+  timezone?: TimezoneCode;
+}
+
+const DEFAULT_SUGGESTIONS = [
+  'Which flights are currently delayed?',
+  'Show arrivals to London Heathrow (LHR)',
+  'Track Emirates flight EK201',
+  'What flights are flying into New York (JFK)?',
+];
+
+export const AIFlightAssistantDrawer: React.FC<AIFlightAssistantDrawerProps> = ({
+  isOpen,
+  onClose,
+  flights,
+  onFocusFlight,
+  prefilledQuery,
+  onClearPrefill,
+  timezone = 'UTC',
+}) => {
+  const [messages, setMessages] = useState<ChatMessage[]>([
+    {
+      id: 'welcome',
+      sender: 'assistant',
+      text: "Hello! I'm your **SkyPulse Airspace Copilot**. I monitor global airspace in real time. Ask me about flight delays, airport arrivals, departures, or specific airlines, and I'll pull live telemetry and let you jump directly to any aircraft on radar.",
+      timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+      matchedFlightNumbers: ['EK201', 'DL405', 'BA117'],
+      suggestedQueries: [
+        'Which flights are delayed right now?',
+        'Show Tokyo (HND) flights',
+        'Show transatlantic departures',
+      ],
+    },
+  ]);
+
+  const [input, setInput] = useState('');
+  const [isLoading, setIsLoading] = useState(false);
+  const [isMinimized, setIsMinimized] = useState(false);
+  const messagesEndRef = useRef<HTMLDivElement | null>(null);
+
+  const scrollToBottom = () => {
+    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  };
+
+  useEffect(() => {
+    if (!isMinimized) {
+      scrollToBottom();
+    }
+  }, [messages, isLoading, isMinimized]);
+
+  // Handle prefilled query triggered from telemetry panel or external chips
+  useEffect(() => {
+    if (prefilledQuery) {
+      setIsMinimized(false);
+      sendMessage(prefilledQuery);
+      if (onClearPrefill) onClearPrefill();
+    }
+  }, [prefilledQuery]);
+
+  const sendMessage = async (userText: string) => {
+    if (!userText.trim() || isLoading) return;
+
+    const queryText = userText.trim();
+    const userMsg: ChatMessage = {
+      id: `user-${Date.now()}`,
+      sender: 'user',
+      text: queryText,
+      timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+    };
+
+    setMessages((prev) => [...prev, userMsg]);
+    setInput('');
+    setIsLoading(true);
+
+    try {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 6000);
+
+      const response = await fetch('/api/ai/chat', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ message: queryText }),
+        signal: controller.signal,
+      });
+      clearTimeout(timeoutId);
+
+      if (!response.ok) {
+        throw new Error(`Server returned ${response.status}`);
+      }
+
+      const data = await response.json();
+
+      const assistantMsg: ChatMessage = {
+        id: `assistant-${Date.now()}`,
+        sender: 'assistant',
+        text: data.reply || 'Here is the current airspace telemetry.',
+        timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+        matchedFlightNumbers: data.matchedFlightNumbers || [],
+        suggestedQueries: data.suggestedQueries || [],
+      };
+
+      setMessages((prev) => [...prev, assistantMsg]);
+    } catch (err) {
+      console.warn('Backend fetch failed or timed out, executing client-side airspace analysis:', err);
+
+      // Intelligent Client-Side Evaluation
+      const q = queryText.toLowerCase();
+      let matchedFlights: Flight[] = [];
+      let reply = '';
+      let matchedNumbers: string[] = [];
+
+      // Check for en route to / destination (e.g. BLR, Bangalore, LHR, JFK)
+      const airportMatches = ['blr', 'bom', 'del', 'dxb', 'lhr', 'jfk', 'hnd', 'sin', 'fra', 'cdg', 'syd', 'sfo', 'lax', 'ams', 'ist'];
+      const matchedCode = airportMatches.find(c => q.includes(c) || (c === 'blr' && (q.includes('bangalore') || q.includes('bengaluru'))) || (c === 'bom' && q.includes('mumbai')) || (c === 'del' && q.includes('delhi')) || (c === 'lhr' && q.includes('london')));
+
+      if (matchedCode) {
+        const isEnroute = q.includes('to') || q.includes('enroute') || q.includes('heading') || q.includes('landing') || q.includes('arriving') || q.includes('arrival');
+        if (isEnroute) {
+          matchedFlights = flights.filter(f => f.destination.code.toLowerCase() === matchedCode);
+        } else {
+          matchedFlights = flights.filter(f => f.destination.code.toLowerCase() === matchedCode || f.origin.code.toLowerCase() === matchedCode);
+        }
+
+        if (matchedFlights.length > 0) {
+          const sample = matchedFlights.slice(0, 4);
+          matchedNumbers = sample.map(f => f.flightNumber);
+          const lines = sample.map(f => `• **${f.flightNumber}** (${f.airline}): ${f.origin.code} ➔ ${f.destination.code} | FL${Math.round(f.altitude / 100)} (${f.altitude.toLocaleString()} ft) · ${f.velocity} kts · ${f.status === 'delayed' ? `Delayed +${f.delayMinutes}m` : 'On Time'}`).join('\n');
+          reply = `Found **${matchedFlights.length} active flights** en route to **${matchedCode.toUpperCase()}**:\n\n${lines}\n\nClick any flight card below to focus and lock onto its live trajectory.`;
+        }
+      }
+
+      // Check for delays
+      if (!reply && (q.includes('delay') || q.includes('late'))) {
+        matchedFlights = flights.filter(f => f.status === 'delayed').slice(0, 4);
+        matchedNumbers = matchedFlights.map(f => f.flightNumber);
+        const lines = matchedFlights.map(f => `• **${f.flightNumber}** (${f.airline}): ${f.origin.code} ➔ ${f.destination.code} — Delayed +${f.delayMinutes}m (ETA ${f.arrivalEstimated})`).join('\n');
+        reply = `Found **${matchedFlights.length} delayed flights** in current airspace:\n\n${lines}`;
+      }
+
+      // Check specific flight number
+      if (!reply) {
+        const single = flights.find(f => q.includes(f.flightNumber.toLowerCase()) || q.includes(f.callsign.toLowerCase()));
+        if (single) {
+          matchedNumbers = [single.flightNumber];
+          reply = `**Flight ${single.flightNumber}** (${single.airline}) is cruising at **FL${Math.round(single.altitude / 100)}** (${single.altitude.toLocaleString()} ft) at **${single.velocity} kts** from **${single.origin.city} (${single.origin.code})** to **${single.destination.city} (${single.destination.code})**. Status: **${single.status === 'delayed' ? `Delayed +${single.delayMinutes}m` : 'On Time'}** (ETA ${single.arrivalEstimated}).`;
+        }
+      }
+
+      // Fallback general
+      if (!reply) {
+        const sample = flights.slice(0, 3);
+        matchedNumbers = sample.map(f => f.flightNumber);
+        reply = `SkyPulse is monitoring **${flights.length} active flights** globally. Here are active flights in monitored airspace. Ask about any airport (e.g., BLR, BOM, DEL, LHR), airline, or delays:`;
+      }
+
+      const assistantMsg: ChatMessage = {
+        id: `assistant-${Date.now()}`,
+        sender: 'assistant',
+        text: reply,
+        timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+        matchedFlightNumbers: matchedNumbers,
+        suggestedQueries: ['Which flights are delayed?', 'Show London Heathrow (LHR) flights', 'Track flight EK201'],
+      };
+      setMessages((prev) => [...prev, assistantMsg]);
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  const handleKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      sendMessage(input);
+    }
+  };
+
+  const handleResetChat = () => {
+    setMessages([
+      {
+        id: 'welcome-reset',
+        sender: 'assistant',
+        text: 'Airspace conversation cleared. How can I assist you with flights today?',
+        timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
+        suggestedQueries: DEFAULT_SUGGESTIONS,
+      },
+    ]);
+  };
+
+  const getFlightByNumber = (flightNum: string): Flight | undefined => {
+    const cleanNum = flightNum.toUpperCase().replace(/\s+/g, '');
+    return flights.find(
+      (f) =>
+        f.flightNumber.toUpperCase() === cleanNum ||
+        f.callsign.toUpperCase() === cleanNum ||
+        f.flightNumber.toUpperCase().includes(cleanNum)
+    );
+  };
+
+  if (!isOpen) return null;
+
+  return (
+    <aside
+      onClick={(e) => e.stopPropagation()}
+      className={`fixed right-4 z-[1050] bg-[#0B0F17]/95 border border-cyan-500/40 rounded-xl shadow-2xl backdrop-blur-xl flex flex-col overflow-hidden transition-all duration-200 ${
+        isMinimized
+          ? 'bottom-4 w-80 h-13'
+          : 'bottom-4 top-24 w-96 max-w-[calc(100vw-2rem)] max-h-[calc(100vh-7rem)]'
+      }`}
+    >
+      {/* Header */}
+      <div className="p-3 bg-slate-900/80 border-b border-slate-800/80 flex items-center justify-between shrink-0">
+        <div className="flex items-center gap-2 cursor-pointer" onClick={() => setIsMinimized(!isMinimized)}>
+          <div className="w-6 h-6 rounded-md bg-cyan-950 border border-cyan-500/40 flex items-center justify-center text-cyan-400">
+            <Sparkles className="w-3.5 h-3.5" />
+          </div>
+          <div>
+            <h2 className="text-xs font-bold text-white tracking-tight flex items-center gap-1.5">
+              Airspace Copilot
+              <span className="text-[10px] font-mono text-cyan-400/90 font-normal">Gemini 3.1 Flash Lite</span>
+            </h2>
+            {!isMinimized && (
+              <div className="text-[10px] text-slate-400">Live arrivals, departures & delay intelligence</div>
+            )}
+          </div>
+        </div>
+
+        <div className="flex items-center gap-1">
+          <button
+            onClick={() => setIsMinimized(!isMinimized)}
+            title={isMinimized ? 'Expand Assistant' : 'Minimize Assistant'}
+            className="p-1.5 text-slate-400 hover:text-slate-200 hover:bg-slate-800 rounded transition-colors"
+          >
+            {isMinimized ? <ChevronUp className="w-3.5 h-3.5" /> : <ChevronDown className="w-3.5 h-3.5" />}
+          </button>
+          {!isMinimized && (
+            <button
+              onClick={handleResetChat}
+              title="Reset Conversation"
+              className="p-1.5 text-slate-400 hover:text-slate-200 hover:bg-slate-800 rounded transition-colors"
+            >
+              <RotateCcw className="w-3.5 h-3.5" />
+            </button>
+          )}
+          <button
+            onClick={onClose}
+            title="Close Assistant"
+            className="p-1.5 text-slate-400 hover:text-slate-200 hover:bg-slate-800 rounded transition-colors"
+          >
+            <X className="w-4 h-4" />
+          </button>
+        </div>
+      </div>
+
+      {!isMinimized && (
+        <>
+          {/* Chat Messages Log */}
+          <div className="flex-1 overflow-y-auto p-3.5 space-y-3 text-xs">
+            {messages.map((msg) => {
+              const isUser = msg.sender === 'user';
+              return (
+                <div
+                  key={msg.id}
+                  className={`flex flex-col ${isUser ? 'items-end' : 'items-start'}`}
+                >
+                  <div
+                    className={`max-w-[90%] rounded-xl p-3 leading-relaxed ${
+                      isUser
+                        ? 'bg-cyan-600 text-slate-950 font-medium rounded-br-none shadow-md'
+                        : 'bg-slate-900/90 border border-slate-800 text-slate-200 rounded-bl-none shadow'
+                    }`}
+                  >
+                    {isUser ? (
+                      <div className="whitespace-pre-wrap">{msg.text}</div>
+                    ) : (
+                      <MarkdownView content={msg.text} />
+                    )}
+
+                    <div
+                      className={`mt-1.5 text-[9px] font-mono ${
+                        isUser ? 'text-slate-900/70' : 'text-slate-500'
+                      }`}
+                    >
+                      {msg.timestamp}
+                    </div>
+                  </div>
+
+                  {/* Embedded Interactive Flight Cards in Assistant Responses */}
+                  {!isUser && msg.matchedFlightNumbers && msg.matchedFlightNumbers.length > 0 && (
+                    <div className="w-full mt-2 space-y-2">
+                      <div className="text-[10px] font-mono uppercase tracking-wider text-cyan-400/80 px-1">
+                        Matching Flights ({msg.matchedFlightNumbers.length})
+                      </div>
+                      {msg.matchedFlightNumbers.map((flightNum) => {
+                        const flight = getFlightByNumber(flightNum);
+                        if (!flight) return null;
+                        const isDelayed = flight.status === 'delayed';
+
+                        return (
+                          <div
+                            key={flight.id}
+                            className="bg-slate-950/90 border border-cyan-500/30 hover:border-cyan-400/80 rounded-lg p-2.5 transition-all shadow-sm group hover:shadow-[0_0_12px_rgba(56,189,248,0.2)]"
+                          >
+                            <div className="flex items-start justify-between gap-2">
+                              <div>
+                                <div className="flex items-center gap-1.5">
+                                  <span className="font-mono text-sm font-bold text-white group-hover:text-cyan-300 transition-colors">
+                                    {flight.flightNumber}
+                                  </span>
+                                  <span className="text-[10px] text-slate-400">
+                                    {flight.airline}
+                                  </span>
+                                </div>
+                                <div className="flex items-center gap-2 mt-1 text-[11px] text-slate-300 font-medium">
+                                  <span className="font-mono text-cyan-300">{flight.origin.code}</span>
+                                  <Plane className="w-3 h-3 text-slate-500 transform rotate-90" />
+                                  <span className="font-mono text-emerald-300">{flight.destination.code}</span>
+                                  <span className="text-slate-500 text-[10px]">
+                                    ({flight.origin.city} ➔ {flight.destination.city})
+                                  </span>
+                                </div>
+                              </div>
+
+                              <div
+                                className={`text-[9px] font-mono px-1.5 py-0.5 rounded font-semibold uppercase shrink-0 ${
+                                  isDelayed
+                                    ? 'bg-amber-500/20 text-amber-300 border border-amber-500/40'
+                                    : 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/40'
+                                }`}
+                              >
+                                {isDelayed ? `Delayed +${flight.delayMinutes}m` : 'On Time'}
+                              </div>
+                            </div>
+
+                            {/* Telemetry snippet */}
+                            <div className="flex items-center justify-between text-[10px] font-mono text-slate-400 mt-2 pt-1.5 border-t border-slate-800/80">
+                              <div>FL{Math.round(flight.altitude / 100)} · {flight.velocity} kts</div>
+                              <div className="text-slate-300">
+                                ETA: {convertUtcTimeString(flight.arrivalEstimated, timezone || 'UTC')}
+                              </div>
+                            </div>
+
+                            {/* Direct Click Action: Jump to Flight on Radar */}
+                            <button
+                              onClick={() => {
+                                onFocusFlight(flight.id);
+                              }}
+                              className="w-full mt-2 flex items-center justify-center gap-1.5 py-1 px-2.5 bg-cyan-950/70 hover:bg-cyan-500 text-cyan-300 hover:text-slate-950 border border-cyan-500/40 hover:border-cyan-400 rounded text-[11px] font-medium transition-all shadow-sm"
+                            >
+                              <Crosshair className="w-3 h-3" />
+                              <span>Focus Flight on Radar</span>
+                              <ArrowUpRight className="w-3 h-3 ml-auto opacity-70" />
+                            </button>
+                          </div>
+                        );
+                      })}
+                    </div>
+                  )}
+
+                  {/* Follow-up Suggestion Chips */}
+                  {!isUser && msg.suggestedQueries && msg.suggestedQueries.length > 0 && (
+                    <div className="flex flex-wrap gap-1.5 mt-2">
+                      {msg.suggestedQueries.map((query, qi) => (
+                        <button
+                          key={qi}
+                          onClick={() => sendMessage(query)}
+                          className="text-[11px] px-2.5 py-1 bg-slate-900/80 hover:bg-slate-800 border border-slate-800 hover:border-slate-700 text-slate-300 hover:text-cyan-300 rounded-md transition-colors text-left"
+                        >
+                          {query}
+                        </button>
+                      ))}
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+
+            {isLoading && (
+              <div className="flex items-center gap-2 p-3 bg-slate-900/60 border border-slate-800 rounded-xl text-slate-400 text-xs w-fit">
+                <Loader2 className="w-3.5 h-3.5 animate-spin text-cyan-400" />
+                <span>Scanning radar feeds & querying flight intelligence...</span>
+              </div>
+            )}
+
+            <div ref={messagesEndRef} />
+          </div>
+
+          {/* Input Box */}
+          <div className="p-3 bg-slate-900/80 border-t border-slate-800 shrink-0">
+            <div className="relative flex items-center">
+              <input
+                type="text"
+                placeholder="Ask about flights, delays, or arrivals..."
+                value={input}
+                onChange={(e) => setInput(e.target.value)}
+                onKeyDown={handleKeyDown}
+                disabled={isLoading}
+                className="w-full bg-slate-950 border border-slate-800 rounded-lg pl-3 pr-10 py-2 text-xs text-slate-100 placeholder-slate-500 focus:outline-none focus:border-cyan-500/70 transition-colors disabled:opacity-50"
+              />
+              <button
+                onClick={() => sendMessage(input)}
+                disabled={!input.trim() || isLoading}
+                className="absolute right-1.5 p-1.5 rounded-md bg-cyan-500 hover:bg-cyan-400 disabled:bg-slate-800 text-slate-950 disabled:text-slate-600 transition-colors"
+              >
+                <Send className="w-3.5 h-3.5" />
+              </button>
+            </div>
+          </div>
+        </>
+      )}
+    </aside>
+  );
+};
