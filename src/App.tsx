@@ -9,10 +9,88 @@ import { AIFlightAssistantDrawer } from './components/AIFlightAssistantDrawer.ts
 import { FlightRosterModal } from './components/FlightRosterModal.tsx';
 import { OpenSkyCredentialsModal } from './components/OpenSkyCredentialsModal.tsx';
 
+export interface MapBounds {
+  lamin: number;
+  lomin: number;
+  lamax: number;
+  lomax: number;
+}
+
+export interface MapCenter {
+  latitude: number;
+  longitude: number;
+}
+
+const INITIAL_RADIUS_KM = 100;
+const FALLBACK_CENTER: MapCenter = { latitude: 12.9716, longitude: 77.5946 };
+
+function boundsAround(center: MapCenter, radiusKm: number): MapBounds {
+  const latitudeDelta = radiusKm / 111.32;
+  const longitudeScale = Math.max(Math.cos(center.latitude * Math.PI / 180), 0.1);
+  const longitudeDelta = radiusKm / (111.32 * longitudeScale);
+  return {
+    lamin: Math.max(-90, center.latitude - latitudeDelta),
+    lomin: Math.max(-180, center.longitude - longitudeDelta),
+    lamax: Math.min(90, center.latitude + latitudeDelta),
+    lomax: Math.min(180, center.longitude + longitudeDelta),
+  };
+}
+
+function distanceKm(a: MapCenter, b: MapCenter): number {
+  const earthRadiusKm = 6371;
+  const dLat = (b.latitude - a.latitude) * Math.PI / 180;
+  const dLon = (b.longitude - a.longitude) * Math.PI / 180;
+  const lat1 = a.latitude * Math.PI / 180;
+  const lat2 = b.latitude * Math.PI / 180;
+  const haversine = Math.sin(dLat / 2) ** 2 + Math.cos(lat1) * Math.cos(lat2) * Math.sin(dLon / 2) ** 2;
+  return earthRadiusKm * 2 * Math.atan2(Math.sqrt(haversine), Math.sqrt(1 - haversine));
+}
+
+function flightsAreEquivalent(previous: Flight[], next: Flight[]): boolean {
+  if (previous.length !== next.length) return false;
+
+  for (let index = 0; index < previous.length; index++) {
+    const a = previous[index];
+    const b = next[index];
+    if (
+      a.id !== b.id ||
+      a.latitude !== b.latitude ||
+      a.longitude !== b.longitude ||
+      a.altitude !== b.altitude ||
+      a.velocity !== b.velocity ||
+      a.heading !== b.heading ||
+      a.verticalRate !== b.verticalRate ||
+      a.origin.code !== b.origin.code ||
+      a.destination.code !== b.destination.code ||
+      a.routeKnown !== b.routeKnown ||
+      a.arrivalEstimated !== b.arrivalEstimated ||
+      a.status !== b.status ||
+      a.trail.length !== b.trail.length
+    ) {
+      return false;
+    }
+  }
+
+  return true;
+}
+
+function boundsChangedMaterially(previous: MapBounds, next: MapBounds): boolean {
+  const latitudeThreshold = Math.max((previous.lamax - previous.lamin) * 0.1, 0.05);
+  const longitudeThreshold = Math.max((previous.lomax - previous.lomin) * 0.1, 0.05);
+
+  return (
+    Math.abs(previous.lamin - next.lamin) >= latitudeThreshold ||
+    Math.abs(previous.lamax - next.lamax) >= latitudeThreshold ||
+    Math.abs(previous.lomin - next.lomin) >= longitudeThreshold ||
+    Math.abs(previous.lomax - next.lomax) >= longitudeThreshold
+  );
+}
+
 export default function App() {
   const [flights, setFlights] = useState<Flight[]>([]);
   const [summary, setSummary] = useState<AirspaceSummary | null>(null);
   const [selectedFlightId, setSelectedFlightId] = useState<string | null>(null);
+  const [resolvingRouteId, setResolvingRouteId] = useState<string | null>(null);
   const [searchQuery, setSearchQuery] = useState('');
   const [activeFilter, setActiveFilter] = useState('all');
   const [selectedAirline, setSelectedAirline] = useState('all');
@@ -24,6 +102,10 @@ export default function App() {
   const [dailyAllowance, setDailyAllowance] = useState(4000);
   const [prefilledQuery, setPrefilledQuery] = useState<string | undefined>(undefined);
   const [isInitialLoading, setIsInitialLoading] = useState(true);
+  const [initialCenter, setInitialCenter] = useState<MapCenter | null>(null);
+  const [locationStatus, setLocationStatus] = useState<'requesting' | 'granted' | 'fallback'>('requesting');
+  const [isInitialScopeActive, setIsInitialScopeActive] = useState(true);
+  const [mapBounds, setMapBounds] = useState<MapBounds>(() => boundsAround(FALLBACK_CENTER, INITIAL_RADIUS_KM));
   const [timezone, setTimezone] = useState<TimezoneCode>(() => {
     return (localStorage.getItem('skypulse_timezone') as TimezoneCode) || 'UTC';
   });
@@ -37,18 +119,48 @@ export default function App() {
     }
   };
 
+  useEffect(() => {
+    const useFallback = () => {
+      setInitialCenter(FALLBACK_CENTER);
+      setMapBounds(boundsAround(FALLBACK_CENTER, INITIAL_RADIUS_KM));
+      setLocationStatus('fallback');
+    };
+
+    if (!('geolocation' in navigator)) {
+      useFallback();
+      return;
+    }
+
+    navigator.geolocation.getCurrentPosition(
+      ({ coords }) => {
+        const center = { latitude: coords.latitude, longitude: coords.longitude };
+        setInitialCenter(center);
+        setMapBounds(boundsAround(center, INITIAL_RADIUS_KM));
+        setLocationStatus('granted');
+      },
+      useFallback,
+      { enableHighAccuracy: false, timeout: 8000, maximumAge: 300000 },
+    );
+  }, []);
+
   // Poll live flights from backend (supporting live OpenSky feed and simulation mode)
-  const fetchFlights = useCallback(async () => {
+  const fetchFlights = useCallback(async (signal?: AbortSignal) => {
     try {
-      const endpoint = isLiveFeed ? '/api/opensky/live' : '/api/flights';
-      const res = await fetch(endpoint);
+      const boundsParams = new URLSearchParams({
+        lamin: mapBounds.lamin.toString(),
+        lomin: mapBounds.lomin.toString(),
+        lamax: mapBounds.lamax.toString(),
+        lomax: mapBounds.lomax.toString(),
+      });
+      const endpoint = isLiveFeed ? `/api/opensky/live?${boundsParams}` : `/api/flights?${boundsParams}`;
+      const res = await fetch(endpoint, { signal });
       const contentType = res.headers.get('content-type');
       if (!res.ok || !contentType || !contentType.includes('application/json')) {
         return;
       }
       const data = await res.json();
-      if (Array.isArray(data.flights)) {
-        setFlights(data.flights);
+      if (Array.isArray(data.flights) && (data.isLive !== false || !isLiveFeed)) {
+        setFlights((previous) => flightsAreEquivalent(previous, data.flights) ? previous : data.flights);
       }
       if (data.summary) {
         setSummary(data.summary);
@@ -59,12 +171,20 @@ export default function App() {
       if (data.dailyAllowance !== undefined) {
         setDailyAllowance(data.dailyAllowance);
       }
-    } catch {
+    } catch (error) {
+      if (error instanceof DOMException && error.name === 'AbortError') return;
       // Ignore transient network glitches during server warm-up
     } finally {
       setIsInitialLoading(false);
     }
-  }, [isLiveFeed]);
+  }, [isLiveFeed, mapBounds]);
+
+  const handleMapBoundsChange = useCallback((bounds: MapBounds) => {
+    setIsInitialScopeActive(false);
+    setMapBounds((previous) => {
+      return boundsChangedMaterially(previous, bounds) ? bounds : previous;
+    });
+  }, []);
 
   // Check OpenSky credentials status on mount
   useEffect(() => {
@@ -89,10 +209,32 @@ export default function App() {
   }, []);
 
   useEffect(() => {
-    fetchFlights();
-    const interval = setInterval(fetchFlights, 2500);
-    return () => clearInterval(interval);
-  }, [fetchFlights]);
+    if (!initialCenter) return;
+    let stopped = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const controller = new AbortController();
+
+    const poll = async () => {
+      await fetchFlights(controller.signal);
+      if (!stopped) {
+        timer = setTimeout(poll, isLiveFeed ? 10000 : 2500);
+      }
+    };
+
+    poll();
+    return () => {
+      stopped = true;
+      controller.abort();
+      if (timer) clearTimeout(timer);
+    };
+  }, [fetchFlights, initialCenter]);
+
+  useEffect(() => {
+    if (isLiveFeed) {
+      setFlights((previous) => previous.filter((flight) => flight.dataSource === 'opensky'));
+      setSummary(null);
+    }
+  }, [isLiveFeed]);
 
   // Extract unique airlines for filter dropdown
   const availableAirlines = useMemo(() => {
@@ -104,6 +246,9 @@ export default function App() {
   // Filtered flights for radar display and directory
   const filteredFlights = useMemo(() => {
     return flights.filter((f) => {
+      if (isInitialScopeActive && initialCenter && distanceKm(initialCenter, { latitude: f.latitude, longitude: f.longitude }) > INITIAL_RADIUS_KM) {
+        return false;
+      }
       // Airline filter
       if (selectedAirline !== 'all' && f.airline !== selectedAirline) {
         return false;
@@ -143,7 +288,7 @@ export default function App() {
 
       return true;
     });
-  }, [flights, selectedAirline, activeFilter, searchQuery]);
+  }, [flights, selectedAirline, activeFilter, searchQuery, initialCenter, isInitialScopeActive]);
 
   // Selected flight object
   const selectedFlight = useMemo(() => {
@@ -154,7 +299,34 @@ export default function App() {
   // Handle focus or deselect on flight from map blip, AI chat flight card, or directory table
   const handleSelectFlight = useCallback((flightId: string | null) => {
     setSelectedFlightId(flightId);
-  }, []);
+    if (!flightId) {
+      setResolvingRouteId(null);
+      return;
+    }
+
+    const selected = flights.find((flight) => flight.id === flightId);
+    if (!selected || selected.routeKnown !== false || selected.dataSource !== 'opensky') return;
+    setResolvingRouteId(flightId);
+
+    const params = new URLSearchParams({
+      lat: selected.latitude.toString(),
+      lng: selected.longitude.toString(),
+    });
+    fetch(`/api/routes/${encodeURIComponent(selected.callsign)}?${params}`)
+      .then((response) => response.ok ? response.json() : null)
+      .then((route) => {
+        if (!route?.routeKnown || !route.origin || !route.destination) return;
+        setFlights((current) => current.map((flight) => flight.id === flightId ? {
+          ...flight,
+          origin: route.origin,
+          destination: route.destination,
+          routeKnown: true,
+          routeSource: 'callsign_estimate',
+        } : flight));
+      })
+      .catch(() => {})
+      .finally(() => setResolvingRouteId((current) => current === flightId ? null : current));
+  }, [flights]);
 
   const handleFocusFromAi = useCallback((flightId: string) => {
     setSelectedFlightId(flightId);
@@ -163,7 +335,7 @@ export default function App() {
 
   const handleAskAiAboutFlight = (flightNumber: string) => {
     setIsAiDrawerOpen(true);
-    setPrefilledQuery(`Give me a complete status report for flight ${flightNumber}, including route conditions and delay diagnostics.`);
+    setPrefilledQuery(`Report the available live telemetry and clearly labelled route estimates for flight ${flightNumber}.`);
   };
 
   const handleResetView = () => {
@@ -174,7 +346,7 @@ export default function App() {
   };
 
   return (
-    <div className="relative w-screen h-screen flex flex-col bg-[#070A0F] text-slate-100 overflow-hidden font-sans select-none">
+    <div className="app-shell relative flex h-screen w-screen flex-col overflow-hidden bg-[#0a0a0a] text-[#efefef] select-none">
       {/* 1. Top Navigation Bar */}
       <TopRadarBar
         searchQuery={searchQuery}
@@ -204,26 +376,24 @@ export default function App() {
 
       {/* 3. Main Viewport: Tactical Radar Canvas */}
       <main className="relative z-0 isolate flex-1 w-full h-full overflow-hidden">
-        {isInitialLoading ? (
-          <div className="w-full h-full flex flex-col items-center justify-center bg-[#070A0F] gap-3">
-            <div className="relative flex h-8 w-8 items-center justify-center">
-              <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-cyan-400 opacity-75"></span>
-              <span className="relative inline-flex rounded-full h-4 w-4 bg-cyan-500"></span>
-            </div>
-            <div className="font-mono text-sm tracking-wider text-cyan-400 uppercase">
-              Initializing Airspace Radar...
-            </div>
-            <div className="text-xs text-slate-500">
-              Establishing transponder links & calibrating great-circle tracks
-            </div>
-          </div>
-        ) : (
+        {initialCenter && (
           <TacticalRadarMap
             flights={filteredFlights}
             selectedFlightId={selectedFlightId}
             onSelectFlight={handleSelectFlight}
+            onBoundsChange={handleMapBoundsChange}
+            initialCenter={initialCenter}
+            initialRadiusKm={INITIAL_RADIUS_KM}
+            scopeLabel={locationStatus === 'granted' ? 'Within 100 km of you' : '100 km around Bengaluru'}
             timezone={timezone}
           />
+        )}
+        {isInitialLoading && (
+          <div className="absolute inset-0 z-[1000] flex flex-col items-center justify-center gap-3 bg-[#0a0a0a]">
+            <span className="size-2 animate-pulse rounded-full bg-[#b11226]" />
+            <div className="text-sm font-medium text-[#efefef]">{locationStatus === 'requesting' ? 'Choose your local airspace' : 'Loading nearby airspace'}</div>
+            <div className="text-xs text-[#737373]">{locationStatus === 'requesting' ? 'Allow location access to start within a 100 km radius' : 'Connecting to nearby aircraft telemetry'}</div>
+          </div>
         )}
 
         {/* 4. Flight Telemetry HUD Panel (shown when aircraft is selected) */}
@@ -232,6 +402,7 @@ export default function App() {
             flight={selectedFlight}
             onClose={() => setSelectedFlightId(null)}
             onAskAiAboutFlight={handleAskAiAboutFlight}
+            isResolvingRoute={resolvingRouteId === selectedFlight.id}
             timezone={timezone}
           />
         )}

@@ -1,13 +1,18 @@
 import React, { useEffect, useRef, useState, useCallback } from 'react';
 import L from 'leaflet';
 import { Flight } from '../types/flight.ts';
-import { TimezoneCode, convertUtcTimeString } from '../utils/time.ts';
-import { Crosshair, Plus, Minus, RotateCcw, Lock, Unlock, Layers, X, Plane, Activity, Gauge, TableProperties } from 'lucide-react';
+import type { MapBounds, MapCenter } from '../App.tsx';
+import { TimezoneCode } from '../utils/time.ts';
+import { Crosshair, Plus, Minus, RotateCcw, Layers, X, TableProperties } from 'lucide-react';
 
 interface TacticalRadarMapProps {
   flights: Flight[];
   selectedFlightId: string | null;
   onSelectFlight: (id: string | null) => void;
+  onBoundsChange?: (bounds: MapBounds) => void;
+  initialCenter: MapCenter;
+  initialRadiusKm?: number;
+  scopeLabel?: string;
   radarSweepEnabled?: boolean;
   timezone?: TimezoneCode;
 }
@@ -16,7 +21,7 @@ type MapLayerType = 'dark' | 'satellite' | 'vector';
 
 // Map altitude to OpenSky tar1090 color palette
 export function getAltitudeColor(altitude: number, isDelayed: boolean, isSelected: boolean): string {
-  if (isSelected) return '#38bdf8'; // Tactical Cyan Focus
+  if (isSelected) return '#b11226';
   if (isDelayed) return '#f59e0b'; // Aviation Delay Amber
   if (altitude < 1500) return '#b45309'; // 0-1.5k ft (Brown/Dark Orange)
   if (altitude < 5000) return '#ea580c'; // 1.5k-5k ft (Orange)
@@ -25,7 +30,7 @@ export function getAltitudeColor(altitude: number, isDelayed: boolean, isSelecte
   if (altitude < 26000) return '#10b981'; // 18k-26k ft (Emerald)
   if (altitude < 33000) return '#06b6d4'; // 26k-33k ft (Cyan / Teal)
   if (altitude < 38000) return '#3b82f6'; // 33k-38k ft (Blue)
-  return '#c084fc'; // 38k-45k+ ft (OpenSky Magenta / Purple)
+  return '#a3a3a3'; // 38k-45k+ ft
 }
 
 function createPlaneIconHtml(flight: Flight, isSelected: boolean, zoom: number): string {
@@ -33,7 +38,7 @@ function createPlaneIconHtml(flight: Flight, isSelected: boolean, zoom: number):
   const color = getAltitudeColor(flight.altitude, isDelayed, isSelected);
 
   const glowStyle = isSelected
-    ? 'filter: drop-shadow(0 0 10px #38bdf8); z-index: 999;'
+    ? 'filter: drop-shadow(0 0 7px rgba(177,18,38,.75)); z-index: 999;'
     : 'filter: drop-shadow(0 0 2px rgba(0,0,0,0.9));';
 
   const reticleRing = isSelected
@@ -44,7 +49,7 @@ function createPlaneIconHtml(flight: Flight, isSelected: boolean, zoom: number):
   const showLabel = isSelected || zoom >= 7;
 
   return `
-    <div class="group relative flex items-center justify-center w-6 h-6 cursor-pointer" style="${glowStyle}" title="${flight.flightNumber} (${flight.airline}) | ${flight.origin.code} ➔ ${flight.destination.code} | FL${Math.round(flight.altitude / 100)} (${flight.altitude.toLocaleString()} ft) · ${flight.velocity} kts">
+    <div class="group relative flex items-center justify-center w-6 h-6 cursor-pointer" style="${glowStyle}" title="${flight.flightNumber} (${flight.airline}) | ${flight.routeKnown === false ? 'Route unknown' : `${flight.origin.code} ➔ ${flight.destination.code}`} | FL${Math.round(flight.altitude / 100)} (${flight.altitude.toLocaleString()} ft) · ${flight.velocity} kts">
       ${reticleRing}
       <div style="transform: rotate(${flight.heading}deg); transition: transform 0.6s ease;" class="plane-rotator w-5 h-5 flex items-center justify-center">
         <svg viewBox="0 0 24 24" fill="${color}" stroke="#070a0f" stroke-width="0.8" class="${isSelected ? 'w-5 h-5 scale-125' : 'w-4 h-4'}">
@@ -64,12 +69,30 @@ function createPlaneIconHtml(flight: Flight, isSelected: boolean, zoom: number):
   `;
 }
 
+function projectPosition(latitude: number, longitude: number, trackDegrees: number, distanceNm: number): [number, number] {
+  const angularDistance = distanceNm / 3440.065;
+  const bearing = trackDegrees * Math.PI / 180;
+  const lat1 = latitude * Math.PI / 180;
+  const lon1 = longitude * Math.PI / 180;
+  const lat2 = Math.asin(
+    Math.sin(lat1) * Math.cos(angularDistance) +
+    Math.cos(lat1) * Math.sin(angularDistance) * Math.cos(bearing)
+  );
+  const lon2 = lon1 + Math.atan2(
+    Math.sin(bearing) * Math.sin(angularDistance) * Math.cos(lat1),
+    Math.cos(angularDistance) - Math.sin(lat1) * Math.sin(lat2)
+  );
+  return [lat2 * 180 / Math.PI, lon2 * 180 / Math.PI];
+}
+
 export const TacticalRadarMap: React.FC<TacticalRadarMapProps> = ({
   flights,
   selectedFlightId,
   onSelectFlight,
-  radarSweepEnabled = true,
-  timezone = 'UTC',
+  onBoundsChange,
+  initialCenter,
+  initialRadiusKm = 100,
+  scopeLabel = 'Local airspace',
 }) => {
   const mapContainerRef = useRef<HTMLDivElement | null>(null);
   const mapInstanceRef = useRef<L.Map | null>(null);
@@ -85,6 +108,8 @@ export const TacticalRadarMap: React.FC<TacticalRadarMapProps> = ({
   const [onScreenCount, setOnScreenCount] = useState<number>(0);
   const [showTarTable, setShowTarTable] = useState(false);
   const [tableSearch, setTableSearch] = useState('');
+  const [viewportRevision, setViewportRevision] = useState(0);
+  const [selectedObservedTrack, setSelectedObservedTrack] = useState<Array<[number, number]>>([]);
 
   const lastCenteredFlightIdRef = useRef<string | null>(null);
   const isCameraLockedRef = useRef(isCameraLocked);
@@ -137,6 +162,22 @@ export const TacticalRadarMap: React.FC<TacticalRadarMapProps> = ({
   const onSelectFlightRef = useRef(onSelectFlight);
   onSelectFlightRef.current = onSelectFlight;
 
+  const onBoundsChangeRef = useRef(onBoundsChange);
+  onBoundsChangeRef.current = onBoundsChange;
+
+  const reportMapBounds = useCallback(() => {
+    const map = mapInstanceRef.current;
+    if (!map || !onBoundsChangeRef.current) return;
+
+    const bounds = map.getBounds().pad(0.1);
+    onBoundsChangeRef.current({
+      lamin: Number(Math.max(-90, bounds.getSouth()).toFixed(2)),
+      lomin: Number(Math.max(-180, bounds.getWest()).toFixed(2)),
+      lamax: Number(Math.min(90, bounds.getNorth()).toFixed(2)),
+      lomax: Number(Math.min(180, bounds.getEast()).toFixed(2)),
+    });
+  }, []);
+
   // Compute on-screen flights inside visible bounding box using stable ref
   const updateOnScreenCount = useCallback(() => {
     const map = mapInstanceRef.current;
@@ -157,8 +198,8 @@ export const TacticalRadarMap: React.FC<TacticalRadarMapProps> = ({
     if (!mapContainerRef.current || mapInstanceRef.current) return;
 
     const map = L.map(mapContainerRef.current, {
-      center: [28, 15],
-      zoom: 3,
+      center: [initialCenter.latitude, initialCenter.longitude],
+      zoom: 9,
       minZoom: 2,
       maxZoom: 16,
       zoomControl: false,
@@ -171,6 +212,25 @@ export const TacticalRadarMap: React.FC<TacticalRadarMapProps> = ({
     trajectoryLayerRef.current = L.layerGroup().addTo(map);
     mapInstanceRef.current = map;
 
+    const localScope = L.circle([initialCenter.latitude, initialCenter.longitude], {
+      radius: initialRadiusKm * 1000,
+      color: '#b11226',
+      weight: 1,
+      opacity: 0.5,
+      fillColor: '#b11226',
+      fillOpacity: 0.025,
+      interactive: false,
+    }).addTo(map);
+    L.circleMarker([initialCenter.latitude, initialCenter.longitude], {
+      radius: 4,
+      color: '#ffffff',
+      weight: 2,
+      fillColor: '#b11226',
+      fillOpacity: 1,
+      interactive: false,
+    }).addTo(map);
+    map.fitBounds(localScope.getBounds(), { padding: [32, 32], maxZoom: 9, animate: false });
+
     map.on('click', () => {
       onSelectFlightRef.current(null);
     });
@@ -181,10 +241,8 @@ export const TacticalRadarMap: React.FC<TacticalRadarMapProps> = ({
 
     map.on('moveend', () => {
       updateOnScreenCount();
-    });
-
-    map.on('zoomend', () => {
-      updateOnScreenCount();
+      setViewportRevision((revision) => revision + 1);
+      reportMapBounds();
     });
 
     // Run initial count once tiles are mounted
@@ -195,7 +253,7 @@ export const TacticalRadarMap: React.FC<TacticalRadarMapProps> = ({
       map.remove();
       mapInstanceRef.current = null;
     };
-  }, [applyTileLayer, updateOnScreenCount]);
+  }, [applyTileLayer, initialCenter, initialRadiusKm, reportMapBounds, updateOnScreenCount]);
 
   useEffect(() => {
     if (mapInstanceRef.current) {
@@ -214,7 +272,13 @@ export const TacticalRadarMap: React.FC<TacticalRadarMapProps> = ({
     if (!map) return;
 
     const currentMarkers = markersRef.current;
-    const activeFlightIds = new Set(flights.map((f) => f.id));
+    const renderBounds = map.getBounds().pad(0.15);
+    const visibleFlights = flights.filter(
+      (flight) =>
+        flight.id === selectedFlightId ||
+        renderBounds.contains([flight.latitude, flight.longitude])
+    );
+    const activeFlightIds = new Set(visibleFlights.map((f) => f.id));
 
     // Remove markers for flights that are no longer active
     currentMarkers.forEach((marker, id) => {
@@ -226,7 +290,7 @@ export const TacticalRadarMap: React.FC<TacticalRadarMapProps> = ({
 
     const currentZoom = map.getZoom();
 
-    flights.forEach((flight) => {
+    visibleFlights.forEach((flight) => {
       const isSelected = flight.id === selectedFlightId;
       const existingMarker = currentMarkers.get(flight.id);
 
@@ -281,7 +345,7 @@ export const TacticalRadarMap: React.FC<TacticalRadarMapProps> = ({
         currentMarkers.set(flight.id, marker);
       }
     });
-  }, [flights, selectedFlightId]);
+  }, [flights, selectedFlightId, viewportRevision]);
 
   // Trajectory arcs, rings, and INITIAL flight selection centering
   useEffect(() => {
@@ -298,9 +362,11 @@ export const TacticalRadarMap: React.FC<TacticalRadarMapProps> = ({
 
     const selectedFlight = flights.find((f) => f.id === selectedFlightId);
     if (!selectedFlight) return;
+    const hasKnownRoute = selectedFlight.routeKnown !== false;
 
-    // 1. Origin Airport Marker
-    const originIcon = L.divIcon({
+    if (hasKnownRoute) {
+      // Callsign-derived airport estimates are shown only when both airports resolve.
+      const originIcon = L.divIcon({
       className: 'airport-marker-icon',
       html: `
         <div class="flex items-center gap-1 bg-slate-900/90 border border-slate-700 rounded px-1.5 py-0.5 text-[9px] font-mono text-cyan-300 shadow cursor-pointer">
@@ -311,12 +377,11 @@ export const TacticalRadarMap: React.FC<TacticalRadarMapProps> = ({
       iconSize: [40, 18],
       iconAnchor: [20, 9],
     });
-    const originMarker = L.marker([selectedFlight.origin.lat, selectedFlight.origin.lon], { icon: originIcon });
-    originMarker.on('click', (e) => L.DomEvent.stopPropagation(e));
-    originMarker.addTo(trajectoryLayer);
+      const originMarker = L.marker([selectedFlight.origin.lat, selectedFlight.origin.lon], { icon: originIcon });
+      originMarker.on('click', (e) => L.DomEvent.stopPropagation(e));
+      originMarker.addTo(trajectoryLayer);
 
-    // 2. Destination Airport Marker
-    const destIcon = L.divIcon({
+      const destIcon = L.divIcon({
       className: 'airport-marker-icon',
       html: `
         <div class="flex items-center gap-1 bg-slate-900/90 border border-slate-700 rounded px-1.5 py-0.5 text-[9px] font-mono text-emerald-300 shadow cursor-pointer">
@@ -327,30 +392,31 @@ export const TacticalRadarMap: React.FC<TacticalRadarMapProps> = ({
       iconSize: [40, 18],
       iconAnchor: [20, 9],
     });
-    const destMarker = L.marker([selectedFlight.destination.lat, selectedFlight.destination.lon], { icon: destIcon });
-    destMarker.on('click', (e) => L.DomEvent.stopPropagation(e));
-    destMarker.addTo(trajectoryLayer);
+      const destMarker = L.marker([selectedFlight.destination.lat, selectedFlight.destination.lon], { icon: destIcon });
+      destMarker.on('click', (e) => L.DomEvent.stopPropagation(e));
+      destMarker.addTo(trajectoryLayer);
 
-    // 3. Full Great Circle Flight Path Arc
-    const arcPath = [
-      [selectedFlight.origin.lat, selectedFlight.origin.lon],
-      ...selectedFlight.trail,
-      [selectedFlight.latitude, selectedFlight.longitude],
-      [selectedFlight.destination.lat, selectedFlight.destination.lon],
-    ] as [number, number][];
+      // Dotted line: direct-to-destination estimate, not a filed flight plan.
+      const directEstimate = L.polyline(
+        [[selectedFlight.latitude, selectedFlight.longitude], [selectedFlight.destination.lat, selectedFlight.destination.lon]],
+        { color: '#38bdf8', weight: 2, opacity: 0.6, dashArray: '2, 8' }
+      );
+      directEstimate.addTo(trajectoryLayer);
+    }
 
-    const arcPolyline = L.polyline(arcPath, {
-      color: '#38bdf8',
-      weight: 2,
-      opacity: 0.65,
-      dashArray: '5, 8',
-    });
-    arcPolyline.on('click', (e) => L.DomEvent.stopPropagation(e));
-    arcPolyline.addTo(trajectoryLayer);
-
-    // 4. Past Flown Trail
-    if (selectedFlight.trail.length > 1) {
-      const trailPoly = L.polyline(selectedFlight.trail, {
+    // Solid line: sampled OpenSky track, extended to the current live position.
+    // OpenSky's experimental track can end at its last sampled waypoint while the
+    // state-vector aircraft continues moving, which otherwise leaves a visible gap.
+    const observedTrail = selectedObservedTrack.length > 1
+      ? [...selectedObservedTrack]
+      : [...selectedFlight.trail];
+    const currentPoint: [number, number] = [selectedFlight.latitude, selectedFlight.longitude];
+    const trailEnd = observedTrail[observedTrail.length - 1];
+    if (!trailEnd || trailEnd[0] !== currentPoint[0] || trailEnd[1] !== currentPoint[1]) {
+      observedTrail.push(currentPoint);
+    }
+    if (observedTrail.length > 1) {
+      const trailPoly = L.polyline(observedTrail, {
         color: '#06b6d4',
         weight: 3,
         opacity: 0.85,
@@ -359,28 +425,19 @@ export const TacticalRadarMap: React.FC<TacticalRadarMapProps> = ({
       trailPoly.addTo(trajectoryLayer);
     }
 
-    // 5. Concentric Tactical Radar Range Rings (100km & 300km)
-    const ring1 = L.circle([selectedFlight.latitude, selectedFlight.longitude], {
-      radius: 100000,
-      color: '#38bdf8',
-      weight: 1,
-      opacity: 0.25,
-      fill: false,
-      dashArray: '3, 6',
-    });
-    ring1.on('click', (e) => L.DomEvent.stopPropagation(e));
-    ring1.addTo(trajectoryLayer);
-
-    const ring2 = L.circle([selectedFlight.latitude, selectedFlight.longitude], {
-      radius: 300000,
-      color: '#38bdf8',
-      weight: 1,
-      opacity: 0.15,
-      fill: false,
-      dashArray: '3, 6',
-    });
-    ring2.on('click', (e) => L.DomEvent.stopPropagation(e));
-    ring2.addTo(trajectoryLayer);
+    // Short dashed line: 10-minute projection using current true track and ground speed.
+    if (selectedFlight.velocityAvailable !== false && selectedFlight.trackAvailable !== false && selectedFlight.velocity > 0) {
+      const projectedPosition = projectPosition(
+        selectedFlight.latitude,
+        selectedFlight.longitude,
+        selectedFlight.heading,
+        selectedFlight.velocity / 6
+      );
+      L.polyline(
+        [[selectedFlight.latitude, selectedFlight.longitude], projectedPosition],
+        { color: '#f59e0b', weight: 2, opacity: 0.8, dashArray: '6, 6' }
+      ).addTo(trajectoryLayer);
+    }
 
     // Center camera upon flight selection and continuously pan with it on every refresh
     if (lastCenteredFlightIdRef.current !== selectedFlightId) {
@@ -400,7 +457,7 @@ export const TacticalRadarMap: React.FC<TacticalRadarMapProps> = ({
         duration: 1.0,
       });
     }
-  }, [selectedFlightId, flights]);
+  }, [selectedFlightId, flights, selectedObservedTrack]);
 
   const handleCenterFlight = () => {
     if (!selectedFlightId) return;
@@ -412,24 +469,35 @@ export const TacticalRadarMap: React.FC<TacticalRadarMapProps> = ({
     }
   };
 
-  const handleToggleLock = () => {
-    const nextLocked = !isCameraLocked;
-    setIsCameraLocked(nextLocked);
-    isCameraLockedRef.current = nextLocked;
-    if (nextLocked && selectedFlightId) {
-      handleCenterFlight();
-    }
-  };
-
   const handleZoomIn = () => mapInstanceRef.current?.zoomIn();
   const handleZoomOut = () => mapInstanceRef.current?.zoomOut();
   const handleResetWorldView = () => {
     setIsCameraLocked(false);
     isCameraLockedRef.current = false;
-    mapInstanceRef.current?.flyTo([25, 10], 3, { animate: true, duration: 1 });
+    const map = mapInstanceRef.current;
+    if (!map) return;
+    const bounds = L.latLng(initialCenter.latitude, initialCenter.longitude).toBounds(initialRadiusKm * 2000);
+    map.flyToBounds(bounds, { padding: [32, 32], maxZoom: 9, duration: 0.8 });
   };
 
   const selectedFlight = flights.find((f) => f.id === selectedFlightId);
+  const isOpenSkyData = flights.some((flight) => flight.dataSource === 'opensky');
+  const selectedIcao24 = selectedFlight?.dataSource === 'opensky' ? selectedFlight.icao24 : undefined;
+
+  useEffect(() => {
+    const controller = new AbortController();
+    setSelectedObservedTrack([]);
+    if (!selectedIcao24) return () => controller.abort();
+
+    fetch(`/api/opensky/track/${encodeURIComponent(selectedIcao24)}`, { signal: controller.signal })
+      .then((response) => response.ok ? response.json() : null)
+      .then((data) => {
+        if (Array.isArray(data?.path)) setSelectedObservedTrack(data.path);
+      })
+      .catch(() => {});
+
+    return () => controller.abort();
+  }, [selectedIcao24]);
 
   const [tableFilterScope, setTableFilterScope] = useState<'onscreen' | 'all'>('onscreen');
   const [jumpAirportCode, setJumpAirportCode] = useState('');
@@ -470,162 +538,48 @@ export const TacticalRadarMap: React.FC<TacticalRadarMapProps> = ({
   }).slice(0, 200);
 
   return (
-    <div className="relative w-full h-full bg-[#070A0F] overflow-hidden">
-      {/* Tactical Radar Grid Overlay */}
-      <div className="absolute inset-0 pointer-events-none z-10 opacity-20 bg-[radial-gradient(#38bdf8_1px,transparent_1px)] [background-size:32px_32px]"></div>
-
-      {/* Radar Sweep Reticle Simulation */}
-      {radarSweepEnabled && (
-        <div className="absolute top-4 right-4 w-36 h-36 rounded-full border border-cyan-500/20 pointer-events-none z-10 hidden xl:flex items-center justify-center overflow-hidden bg-cyan-950/5">
-          <div className="absolute inset-0 rounded-full border border-cyan-500/10 scale-75"></div>
-          <div className="absolute inset-0 rounded-full border border-cyan-500/10 scale-50"></div>
-          <div className="absolute w-full h-[1px] bg-cyan-500/15"></div>
-          <div className="absolute h-full w-[1px] bg-cyan-500/15"></div>
-          <div className="absolute inset-0 bg-gradient-to-tr from-transparent via-transparent to-cyan-500/25 radar-sweep-anim"></div>
-          <div className="absolute bottom-2 text-[9px] font-mono text-cyan-400/60 uppercase tracking-widest">
-            RADAR 360°
-          </div>
-        </div>
-      )}
+    <div className="relative w-full h-full bg-[#0a0a0a] overflow-hidden">
 
       {/* Map Container */}
       <div ref={mapContainerRef} className="w-full h-full" />
 
       {/* OpenSky / tar1090 Aircraft Stats Counter Widget (Top Left, z-[500]) */}
-      <div className="absolute top-4 left-4 z-[500] flex items-center gap-3 bg-[#0B0F17]/95 border border-cyan-500/40 rounded-xl px-3.5 py-2 shadow-2xl backdrop-blur-xl font-mono text-xs">
+      <div className="map-surface absolute top-4 left-4 z-[500] flex items-center gap-3 px-3 py-2 font-mono text-xs">
         <div>
-          <div className="text-[10px] text-slate-400 uppercase tracking-wider font-sans">OpenSky Fleet Telemetry</div>
+          <div className="text-[11px] text-[#737373] font-sans">{scopeLabel} · {isOpenSkyData ? 'OpenSky' : 'Simulation'}</div>
           <div className="flex items-center gap-2 mt-0.5">
-            <span className="text-slate-300">Total Aircraft:</span>
-            <span className="font-bold text-cyan-300">10,615</span>
-            <span className="text-slate-600">·</span>
-            <span className="text-slate-300">Active Radar:</span>
-            <span className="font-bold text-emerald-400">{flights.length}</span>
-            <span className="text-slate-600">·</span>
-            <span className="text-slate-300">On Screen:</span>
-            <span className="font-bold text-purple-300">{onScreenCount}</span>
+            <span className="text-[#b8b8b8]">{flights.length} loaded</span>
+            <span className="text-[#525252]">·</span>
+            <span className="text-white">{onScreenCount} on screen</span>
           </div>
         </div>
 
         <button
           onClick={() => setShowTarTable(!showTarTable)}
           title="Toggle OpenSky tar1090 Flight Directory Sidebar"
-          className={`p-1.5 rounded-lg border transition-colors ${
+          className={`icon-button size-8 ${
             showTarTable
-              ? 'bg-cyan-500 text-slate-950 font-bold border-cyan-400'
-              : 'bg-slate-900 text-slate-300 hover:text-cyan-300 border-slate-700'
+              ? 'is-active'
+              : ''
           }`}
         >
           <TableProperties className="w-4 h-4" />
         </button>
       </div>
 
-      {/* Tactical Top Flight Summary Banner (Always visible when flight is selected, z-[500] above Leaflet) */}
-      {selectedFlight && (
-        <div
-          onClick={(e) => e.stopPropagation()}
-          className="absolute top-4 left-1/2 -translate-x-1/2 z-[500] max-w-[95vw] bg-[#0B0F17]/95 border border-cyan-500/50 rounded-xl px-4 py-2.5 shadow-2xl backdrop-blur-xl flex flex-wrap items-center gap-4 text-xs font-mono animate-in fade-in slide-in-from-top-2 duration-150"
-        >
-          <div className="flex items-center gap-2">
-            <div className="w-6 h-6 rounded-md bg-cyan-950 border border-cyan-500/40 flex items-center justify-center text-cyan-400">
-              <Plane className="w-3.5 h-3.5 transform -rotate-45" />
-            </div>
-            <div>
-              <div className="font-bold text-white text-sm flex items-center gap-1.5">
-                <span>{selectedFlight.flightNumber}</span>
-                <span className="text-[10px] text-slate-400 font-normal">({selectedFlight.airline})</span>
-              </div>
-              <div className="text-[10px] text-slate-400 font-sans">
-                {selectedFlight.aircraftType} · {selectedFlight.registration}
-              </div>
-            </div>
-          </div>
-
-          <div className="h-6 w-[1px] bg-slate-800 hidden sm:block"></div>
-
-          <div className="flex items-center gap-2">
-            <span className="font-bold text-cyan-300">{selectedFlight.origin.code}</span>
-            <span className="text-slate-500 text-[10px]">➔</span>
-            <span className="font-bold text-emerald-300">{selectedFlight.destination.code}</span>
-            <span className="text-[10px] text-slate-400 hidden md:inline">
-              ({selectedFlight.origin.city} to {selectedFlight.destination.city})
-            </span>
-          </div>
-
-          <div className="h-6 w-[1px] bg-slate-800 hidden sm:block"></div>
-
-          <div className="flex items-center gap-3">
-            <div className="flex items-center gap-1">
-              <Activity className="w-3 h-3 text-cyan-400" />
-              <span className="text-slate-300">FL{Math.round(selectedFlight.altitude / 100)}</span>
-            </div>
-            <div className="flex items-center gap-1">
-              <Gauge className="w-3 h-3 text-cyan-400" />
-              <span className="text-slate-300">{selectedFlight.velocity} kts</span>
-            </div>
-            <span
-              className={`text-[9px] px-1.5 py-0.5 rounded font-semibold uppercase ${
-                selectedFlight.status === 'delayed'
-                  ? 'bg-amber-500/20 text-amber-300 border border-amber-500/40'
-                  : 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/40'
-              }`}
-            >
-              {selectedFlight.status === 'delayed' ? `Delayed +${selectedFlight.delayMinutes}m` : 'On Time'}
-            </span>
-
-            <span className="text-[11px] text-slate-400 font-mono hidden md:inline">
-              ETA: <span className="text-emerald-300 font-semibold">{convertUtcTimeString(selectedFlight.arrivalEstimated, timezone)}</span>
-            </span>
-          </div>
-
-          <div className="h-6 w-[1px] bg-slate-800 hidden sm:block"></div>
-
-          <div className="flex items-center gap-2 ml-auto">
-            <button
-              onClick={handleToggleLock}
-              className={`flex items-center gap-1 px-2.5 py-1 rounded text-[10px] font-semibold transition-all ${
-                isCameraLocked
-                  ? 'bg-cyan-500/25 text-cyan-300 border border-cyan-400/60 shadow-[0_0_8px_rgba(56,189,248,0.3)]'
-                  : 'bg-slate-800/80 text-slate-300 hover:text-white border border-slate-700'
-              }`}
-              title={isCameraLocked ? 'Aircraft is locked in center (moves on refresh). Click for Free Cam.' : 'Click to lock aircraft in center'}
-            >
-              {isCameraLocked ? <Lock className="w-3 h-3 text-cyan-400" /> : <Unlock className="w-3 h-3 text-slate-400" />}
-              <span className="hidden sm:inline">{isCameraLocked ? 'Center: Locked' : 'Free Cam'}</span>
-            </button>
-
-            <button
-              onClick={handleCenterFlight}
-              title="Center on Flight"
-              className="p-1 rounded bg-slate-800/80 hover:bg-slate-700 text-cyan-400 transition-colors"
-            >
-              <Crosshair className="w-3.5 h-3.5" />
-            </button>
-
-            <button
-              onClick={() => onSelectFlight(null)}
-              title="Deselect Flight"
-              className="p-1 rounded bg-slate-800/80 hover:bg-red-950/80 hover:text-red-300 text-slate-400 transition-colors"
-            >
-              <X className="w-3.5 h-3.5" />
-            </button>
-          </div>
-        </div>
-      )}
-
-      {/* Floating Tactical Map Controls (Bottom Left, z-[500]) */}
-      <div className="absolute bottom-16 left-6 z-[500] flex flex-col gap-2">
+      {/* Map controls */}
+      <div className="absolute bottom-5 left-4 z-[500] flex flex-col gap-2">
         <div className="relative">
           <button
             onClick={() => setShowLayerMenu(!showLayerMenu)}
             title="Map Style"
-            className="p-2 bg-[#0B0F17]/90 border border-slate-800 rounded-lg text-slate-300 hover:text-cyan-400 hover:bg-slate-800/60 shadow-xl backdrop-blur-md transition-colors"
+            className="icon-button"
           >
             <Layers className="w-4 h-4" />
           </button>
 
           {showLayerMenu && (
-            <div className="absolute left-10 bottom-0 bg-[#0B0F17]/95 border border-slate-800 rounded-lg p-1 shadow-2xl backdrop-blur-md flex flex-col gap-1 w-36 text-xs z-[600]">
+            <div className="menu-panel absolute bottom-0 left-12 z-[600] flex w-40 flex-col gap-1 p-1.5 text-xs">
               <button
                 onClick={() => {
                   setMapLayer('dark');
@@ -635,7 +589,7 @@ export const TacticalRadarMap: React.FC<TacticalRadarMapProps> = ({
                   mapLayer === 'dark' ? 'bg-cyan-500/20 text-cyan-300' : 'text-slate-400 hover:text-slate-200'
                 }`}
               >
-                Tactical Dark (ESRI)
+                Dark map
               </button>
               <button
                 onClick={() => {
@@ -646,7 +600,7 @@ export const TacticalRadarMap: React.FC<TacticalRadarMapProps> = ({
                   mapLayer === 'satellite' ? 'bg-cyan-500/20 text-cyan-300' : 'text-slate-400 hover:text-slate-200'
                 }`}
               >
-                Satellite Airspace
+                Satellite
               </button>
               <button
                 onClick={() => {
@@ -657,24 +611,24 @@ export const TacticalRadarMap: React.FC<TacticalRadarMapProps> = ({
                   mapLayer === 'vector' ? 'bg-cyan-500/20 text-cyan-300' : 'text-slate-400 hover:text-slate-200'
                 }`}
               >
-                OSM Radar Vector
+                Street map
               </button>
             </div>
           )}
         </div>
 
-        <div className="flex flex-col bg-[#0B0F17]/90 border border-slate-800 rounded-lg shadow-xl overflow-hidden backdrop-blur-md">
+        <div className="map-surface flex flex-col overflow-hidden">
           <button
             onClick={handleZoomIn}
             title="Zoom In"
-            className="p-2 text-slate-300 hover:text-cyan-400 hover:bg-slate-800/60 transition-colors border-b border-slate-800"
+            className="flex size-10 items-center justify-center border-b border-white/8 text-[#8c8c8c] hover:bg-white/5 hover:text-white"
           >
             <Plus className="w-4 h-4" />
           </button>
           <button
             onClick={handleZoomOut}
             title="Zoom Out"
-            className="p-2 text-slate-300 hover:text-cyan-400 hover:bg-slate-800/60 transition-colors"
+            className="flex size-10 items-center justify-center text-[#8c8c8c] hover:bg-white/5 hover:text-white"
           >
             <Minus className="w-4 h-4" />
           </button>
@@ -682,8 +636,8 @@ export const TacticalRadarMap: React.FC<TacticalRadarMapProps> = ({
 
         <button
           onClick={handleResetWorldView}
-          title="Reset World Airspace View"
-          className="p-2 bg-[#0B0F17]/90 border border-slate-800 rounded-lg text-slate-300 hover:text-cyan-400 hover:bg-slate-800/60 shadow-xl backdrop-blur-md transition-colors"
+          title="Return to your 100 km area"
+          className="icon-button"
         >
           <RotateCcw className="w-4 h-4" />
         </button>
@@ -692,7 +646,7 @@ export const TacticalRadarMap: React.FC<TacticalRadarMapProps> = ({
           <button
             onClick={handleCenterFlight}
             title="Center Camera on Selected Flight"
-            className="p-2 bg-cyan-500/20 border border-cyan-400/60 rounded-lg text-cyan-300 hover:bg-cyan-500/30 shadow-xl backdrop-blur-md transition-colors animate-pulse"
+            className="icon-button is-active"
           >
             <Crosshair className="w-4 h-4" />
           </button>
@@ -703,15 +657,15 @@ export const TacticalRadarMap: React.FC<TacticalRadarMapProps> = ({
       {showTarTable && (
         <aside
           onClick={(e) => e.stopPropagation()}
-          className="absolute top-4 right-4 bottom-14 w-[420px] max-w-[calc(100vw-2rem)] z-[1000] bg-[#0B0F17]/95 border border-cyan-500/40 rounded-xl shadow-2xl backdrop-blur-xl flex flex-col overflow-hidden font-mono text-xs animate-in fade-in slide-in-from-right-4 duration-200"
+          className="inspector-panel absolute bottom-4 right-4 top-4 z-[1000] flex w-[420px] max-w-[calc(100vw-2rem)] flex-col overflow-hidden font-mono text-xs animate-in fade-in slide-in-from-right-4 duration-200"
         >
           <div className="p-3 bg-slate-900/90 border-b border-slate-800 flex items-center justify-between shrink-0">
             <div>
               <div className="font-bold text-white flex items-center gap-2">
-                <span>OpenSky tar1090 Flight Directory</span>
+                <span>Aircraft on radar</span>
               </div>
               <div className="text-[10px] text-slate-400 mt-0.5">
-                Total Aircraft: <span className="text-cyan-300 font-bold">10,615</span> · On Screen: <span className="text-purple-300 font-bold">{onScreenCount}</span>
+                {flights.length} loaded · {onScreenCount} on screen
               </div>
             </div>
             <button
@@ -812,17 +766,17 @@ export const TacticalRadarMap: React.FC<TacticalRadarMapProps> = ({
                         <span className={isSel ? 'text-cyan-300' : 'text-slate-200'}>{f.callsign}</span>
                       </td>
                       <td className="py-1 px-2 text-slate-400 truncate max-w-[85px]">
-                        {f.origin.code}-{f.destination.code}
+                        {f.routeKnown === false ? 'Route unknown' : `${f.origin.code}-${f.destination.code}`}
                       </td>
                       <td className="py-1 px-2 text-slate-400 truncate max-w-[70px]">
                         {f.aircraftType.split(' ')[0]}
                       </td>
                       <td className="py-1 px-2 text-slate-400">{f.squawk}</td>
                       <td className="py-1 px-2 text-right tabular-nums font-semibold" style={{ color: altColor }}>
-                        {f.altitude.toLocaleString()}
+                        {f.altitudeAvailable === false ? '—' : f.altitude.toLocaleString()}
                       </td>
                       <td className="py-1 px-2 text-right tabular-nums text-slate-400">
-                        {f.velocity}
+                        {f.velocityAvailable === false ? '—' : f.velocity}
                       </td>
                     </tr>
                   );
@@ -832,21 +786,6 @@ export const TacticalRadarMap: React.FC<TacticalRadarMapProps> = ({
           </div>
         </aside>
       )}
-
-      {/* Authentic OpenSky tar1090 Altitude Color Scale Bar (Bottom Center, z-[500]) */}
-      <div className="absolute bottom-4 left-1/2 -translate-x-1/2 z-[500] flex flex-col items-center bg-[#0B0F17]/95 border border-slate-800/90 rounded-lg px-3 py-1 shadow-2xl backdrop-blur-md font-mono text-[9px] text-slate-400">
-        <div className="flex items-center justify-between w-full text-[8px] uppercase tracking-wider text-slate-500 mb-0.5">
-          <span>ALTITUDE (ft)</span>
-          <span>0</span>
-          <span>1,000</span>
-          <span>5,000</span>
-          <span>10,000</span>
-          <span>20,000</span>
-          <span>30,000</span>
-          <span>40,000+</span>
-        </div>
-        <div className="w-72 sm:w-96 h-2 rounded overflow-hidden bg-gradient-to-r from-[#b45309] via-[#ea580c] via-[#eab308] via-[#84cc16] via-[#10b981] via-[#06b6d4] via-[#3b82f6] to-[#c084fc]"></div>
-      </div>
     </div>
   );
 };

@@ -1,5 +1,5 @@
 import React, { useState } from 'react';
-import { KeyRound, ShieldCheck, AlertCircle, X, ExternalLink, Zap, CheckCircle2, Loader2, Gauge } from 'lucide-react';
+import { KeyRound, AlertCircle, X, ExternalLink, Zap, CheckCircle2, Loader2, Gauge } from 'lucide-react';
 
 interface OpenSkyCredentialsModalProps {
   isOpen: boolean;
@@ -20,11 +20,8 @@ export const OpenSkyCredentialsModal: React.FC<OpenSkyCredentialsModalProps> = (
   dailyAllowance,
   onCredentialsSaved,
 }) => {
-  const [authMode, setAuthMode] = useState<'oauth' | 'basic'>('oauth');
   const [clientId, setClientId] = useState('');
   const [clientSecret, setClientSecret] = useState('');
-  const [username, setUsername] = useState('');
-  const [password, setPassword] = useState('');
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [statusMessage, setStatusMessage] = useState<{ type: 'success' | 'error'; text: string } | null>(null);
 
@@ -36,10 +33,7 @@ export const OpenSkyCredentialsModal: React.FC<OpenSkyCredentialsModalProps> = (
     setStatusMessage(null);
 
     try {
-      const payload =
-        authMode === 'oauth'
-          ? { clientId: clientId.trim(), clientSecret: clientSecret.trim() }
-          : { username: username.trim(), password: password.trim() };
+      const payload = { clientId: clientId.trim(), clientSecret: clientSecret.trim() };
 
       const res = await fetch('/api/opensky/credentials', {
         method: 'POST',
@@ -47,8 +41,8 @@ export const OpenSkyCredentialsModal: React.FC<OpenSkyCredentialsModalProps> = (
         body: JSON.stringify(payload),
       });
 
-      if (!res.ok) throw new Error('Failed to update credentials');
       const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Failed to validate credentials');
 
       setStatusMessage({
         type: 'success',
@@ -79,8 +73,8 @@ export const OpenSkyCredentialsModal: React.FC<OpenSkyCredentialsModalProps> = (
               <KeyRound className="w-4 h-4" />
             </div>
             <div>
-              <h3 className="font-bold text-white text-sm">OpenSky Network Credentials & Rate Limits</h3>
-              <p className="text-[10px] text-slate-400">Direct Mode-S ADS-B Telemetry Ingestion</p>
+              <h3 className="font-bold text-white text-sm">OpenSky connection</h3>
+              <p className="text-[11px] text-slate-400">Credentials and API usage</p>
             </div>
           </div>
           <button
@@ -96,7 +90,7 @@ export const OpenSkyCredentialsModal: React.FC<OpenSkyCredentialsModalProps> = (
           <div className="flex items-center justify-between font-mono">
             <span className="text-slate-300 font-semibold flex items-center gap-1.5">
               <Gauge className="w-3.5 h-3.5 text-cyan-400" />
-              <span>Daily Rate Limit Allowance:</span>
+              <span>Daily API allowance</span>
             </span>
             <span className="text-cyan-300 font-bold tabular-nums">
               {creditsRemaining.toLocaleString()} / {dailyAllowance.toLocaleString()} credits remaining
@@ -111,39 +105,17 @@ export const OpenSkyCredentialsModal: React.FC<OpenSkyCredentialsModalProps> = (
           </div>
 
           <div className="text-[11px] text-slate-300 leading-relaxed">
-            <span className="text-amber-300 font-semibold">Credit Budgeting:</span> Bounding-box queries (e.g. your active radar screen view) consume <strong className="text-white">1 credit</strong> per poll, whereas full global queries cost <strong className="text-white">4 credits</strong>. We automatically query your current map view to conserve your 4,000 daily credits.
+            OpenSky charges <strong className="text-white">1–4 credits</strong> per state query based on the visible map area. Smaller areas cost fewer credits; global views cost 4.
+            Selecting an aircraft may also use the separate track credit bucket.
           </div>
         </div>
 
         {/* Form Body */}
         <form onSubmit={handleSave} className="p-4 space-y-4">
-          <div className="flex items-center gap-2 bg-slate-900/90 p-1 rounded-lg border border-slate-800">
-            <button
-              type="button"
-              onClick={() => setAuthMode('oauth')}
-              className={`flex-1 py-1.5 rounded text-[11px] font-medium transition-colors ${
-                authMode === 'oauth'
-                  ? 'bg-cyan-500/20 text-cyan-300 border border-cyan-500/40 font-bold'
-                  : 'text-slate-400 hover:text-slate-200'
-              }`}
-            >
-              OAuth2 Client ID & Secret (Recommended)
-            </button>
-            <button
-              type="button"
-              onClick={() => setAuthMode('basic')}
-              className={`flex-1 py-1.5 rounded text-[11px] font-medium transition-colors ${
-                authMode === 'basic'
-                  ? 'bg-cyan-500/20 text-cyan-300 border border-cyan-500/40 font-bold'
-                  : 'text-slate-400 hover:text-slate-200'
-              }`}
-            >
-              Username & Password (Basic)
-            </button>
-          </div>
-
-          {authMode === 'oauth' ? (
-            <div className="space-y-3">
+          <div className="space-y-3">
+              <div className="text-[11px] text-slate-300 bg-slate-900/70 border border-slate-800 rounded-lg p-2.5">
+                OpenSky requires OAuth2 client credentials. Legacy username/password authentication is no longer accepted.
+              </div>
               <div>
                 <label className="block text-slate-400 text-[11px] mb-1 font-mono">OpenSky Client ID</label>
                 <input
@@ -173,7 +145,7 @@ export const OpenSkyCredentialsModal: React.FC<OpenSkyCredentialsModalProps> = (
                 <span>
                   Generate an API Client in your{' '}
                   <a
-                    href="https://opensky-network.org/index.php?option=com_users&view=profile"
+                    href="https://opensky-network.org/my-opensky/account"
                     target="_blank"
                     rel="noreferrer"
                     className="text-cyan-400 underline hover:text-cyan-300"
@@ -182,34 +154,7 @@ export const OpenSkyCredentialsModal: React.FC<OpenSkyCredentialsModalProps> = (
                   </a>
                 </span>
               </div>
-            </div>
-          ) : (
-            <div className="space-y-3">
-              <div>
-                <label className="block text-slate-400 text-[11px] mb-1 font-mono">OpenSky Username</label>
-                <input
-                  type="text"
-                  placeholder="your_username"
-                  value={username}
-                  onChange={(e) => setUsername(e.target.value)}
-                  className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-slate-200 font-mono text-xs focus:outline-none focus:border-cyan-500"
-                  required
-                />
-              </div>
-
-              <div>
-                <label className="block text-slate-400 text-[11px] mb-1 font-mono">OpenSky Password</label>
-                <input
-                  type="password"
-                  placeholder="••••••••••••••••"
-                  value={password}
-                  onChange={(e) => setPassword(e.target.value)}
-                  className="w-full bg-slate-950 border border-slate-800 rounded-lg px-3 py-2 text-slate-200 font-mono text-xs focus:outline-none focus:border-cyan-500"
-                  required
-                />
-              </div>
-            </div>
-          )}
+          </div>
 
           {statusMessage && (
             <div

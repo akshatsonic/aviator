@@ -15,7 +15,7 @@ export interface Flight {
   airline: string; // e.g. "Turkish Airlines", "Delta Air Lines"
   airlineCode: string; // e.g. "TK", "DL"
   aircraftType: string; // e.g. "Boeing 777-300ER"
-  aircraftCategory: 'Heavy' | 'Super' | 'Medium' | 'Regional';
+  aircraftCategory: string;
   registration: string; // e.g. "TC-LJI", "N120DX"
   origin: Airport;
   destination: Airport;
@@ -26,7 +26,7 @@ export interface Flight {
   heading: number; // in degrees (0-360)
   verticalRate: number; // in ft/min (e.g. 0, +1200, -800)
   squawk: string; // e.g. "4721"
-  status: 'on_time' | 'delayed' | 'approaching' | 'boarding' | 'diverted';
+  status: 'on_time' | 'delayed' | 'approaching' | 'boarding' | 'diverted' | 'unknown';
   delayMinutes: number;
   departureScheduled: string;
   departureActual: string;
@@ -34,6 +34,20 @@ export interface Flight {
   arrivalEstimated: string;
   progressPercent: number; // 0 - 100
   trail: Array<[number, number]>; // Historical GPS coordinates for trailing track
+  dataSource?: 'simulation' | 'opensky';
+  routeKnown?: boolean;
+  routeSource?: 'simulation' | 'callsign_estimate' | 'unknown';
+  scheduleKnown?: boolean;
+  etaType?: 'scheduled' | 'direct_estimate' | 'unavailable';
+  icao24?: string;
+  positionTime?: number | null;
+  lastContact?: number | null;
+  geoAltitude?: number | null;
+  positionSource?: 'ADS-B' | 'ASTERIX' | 'MLAT' | 'FLARM' | 'Unknown';
+  altitudeAvailable?: boolean;
+  velocityAvailable?: boolean;
+  trackAvailable?: boolean;
+  verticalRateAvailable?: boolean;
 }
 
 export interface AirspaceSummary {

@@ -15,10 +15,10 @@ interface AIFlightAssistantDrawerProps {
 }
 
 const DEFAULT_SUGGESTIONS = [
-  'Which flights are currently delayed?',
-  'Show arrivals to London Heathrow (LHR)',
-  'Track Emirates flight EK201',
-  'What flights are flying into New York (JFK)?',
+  'Which aircraft have the highest altitude?',
+  'Show available London Heathrow route estimates',
+  'Explain the path lines on the radar',
+  'Which aircraft are moving fastest?',
 ];
 
 export const AIFlightAssistantDrawer: React.FC<AIFlightAssistantDrawerProps> = ({
@@ -34,13 +34,13 @@ export const AIFlightAssistantDrawer: React.FC<AIFlightAssistantDrawerProps> = (
     {
       id: 'welcome',
       sender: 'assistant',
-      text: "Hello! I'm your **SkyPulse Airspace Copilot**. I monitor global airspace in real time. Ask me about flight delays, airport arrivals, departures, or specific airlines, and I'll pull live telemetry and let you jump directly to any aircraft on radar.",
+      text: "Hello! I'm your **SkyPulse Airspace Copilot**. Ask me about aircraft position, altitude, speed, true track, or available route estimates. OpenSky telemetry does not include airline schedules or delay status.",
       timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
       matchedFlightNumbers: ['EK201', 'DL405', 'BA117'],
       suggestedQueries: [
-        'Which flights are delayed right now?',
-        'Show Tokyo (HND) flights',
-        'Show transatlantic departures',
+        'Which aircraft have the highest altitude?',
+        'Show Tokyo (HND) route estimates',
+        'Explain the OpenSky telemetry fields',
       ],
     },
   ]);
@@ -91,7 +91,10 @@ export const AIFlightAssistantDrawer: React.FC<AIFlightAssistantDrawerProps> = (
       const response = await fetch('/api/ai/chat', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ message: queryText }),
+        body: JSON.stringify({
+          message: queryText,
+          useLiveData: flights.some((flight) => flight.dataSource === 'opensky'),
+        }),
         signal: controller.signal,
       });
       clearTimeout(timeoutId);
@@ -136,7 +139,7 @@ export const AIFlightAssistantDrawer: React.FC<AIFlightAssistantDrawerProps> = (
         if (matchedFlights.length > 0) {
           const sample = matchedFlights.slice(0, 4);
           matchedNumbers = sample.map(f => f.flightNumber);
-          const lines = sample.map(f => `• **${f.flightNumber}** (${f.airline}): ${f.origin.code} ➔ ${f.destination.code} | FL${Math.round(f.altitude / 100)} (${f.altitude.toLocaleString()} ft) · ${f.velocity} kts · ${f.status === 'delayed' ? `Delayed +${f.delayMinutes}m` : 'On Time'}`).join('\n');
+          const lines = sample.map(f => `• **${f.flightNumber}** (${f.airline}): ${f.routeKnown === false ? 'route unavailable' : `${f.origin.code} ➔ ${f.destination.code}`} | FL${Math.round(f.altitude / 100)} (${f.altitude.toLocaleString()} ft) · ${f.velocity} kts · ${f.status === 'delayed' ? `Delayed +${f.delayMinutes}m` : f.status === 'unknown' ? 'schedule status unavailable' : 'On Time'}`).join('\n');
           reply = `Found **${matchedFlights.length} active flights** en route to **${matchedCode.toUpperCase()}**:\n\n${lines}\n\nClick any flight card below to focus and lock onto its live trajectory.`;
         }
       }
@@ -154,7 +157,9 @@ export const AIFlightAssistantDrawer: React.FC<AIFlightAssistantDrawerProps> = (
         const single = flights.find(f => q.includes(f.flightNumber.toLowerCase()) || q.includes(f.callsign.toLowerCase()));
         if (single) {
           matchedNumbers = [single.flightNumber];
-          reply = `**Flight ${single.flightNumber}** (${single.airline}) is cruising at **FL${Math.round(single.altitude / 100)}** (${single.altitude.toLocaleString()} ft) at **${single.velocity} kts** from **${single.origin.city} (${single.origin.code})** to **${single.destination.city} (${single.destination.code})**. Status: **${single.status === 'delayed' ? `Delayed +${single.delayMinutes}m` : 'On Time'}** (ETA ${single.arrivalEstimated}).`;
+          const route = single.routeKnown === false ? 'Its route is unavailable from live OpenSky telemetry.' : `Its callsign-derived route estimate is ${single.origin.city} (${single.origin.code}) to ${single.destination.city} (${single.destination.code}).`;
+          const eta = single.arrivalEstimated ? ` Direct ETA estimate: ${single.arrivalEstimated} UTC.` : '';
+          reply = `**Flight ${single.flightNumber}** (${single.airline}) is at **FL${Math.round(single.altitude / 100)}** (${single.altitude.toLocaleString()} ft), moving at **${single.velocity} kts** on true track **${single.heading}°**. ${route}${eta}`;
         }
       }
 
@@ -171,7 +176,7 @@ export const AIFlightAssistantDrawer: React.FC<AIFlightAssistantDrawerProps> = (
         text: reply,
         timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
         matchedFlightNumbers: matchedNumbers,
-        suggestedQueries: ['Which flights are delayed?', 'Show London Heathrow (LHR) flights', 'Track flight EK201'],
+        suggestedQueries: ['Which aircraft are moving fastest?', 'Show London Heathrow route estimates', 'Explain the selected track'],
       };
       setMessages((prev) => [...prev, assistantMsg]);
     } finally {
@@ -213,7 +218,7 @@ export const AIFlightAssistantDrawer: React.FC<AIFlightAssistantDrawerProps> = (
   return (
     <aside
       onClick={(e) => e.stopPropagation()}
-      className={`fixed right-4 z-[1050] bg-[#0B0F17]/95 border border-cyan-500/40 rounded-xl shadow-2xl backdrop-blur-xl flex flex-col overflow-hidden transition-all duration-200 ${
+      className={`assistant-panel fixed left-4 z-[1050] flex flex-col overflow-hidden transition-all duration-200 ${
         isMinimized
           ? 'bottom-4 w-80 h-13'
           : 'bottom-4 top-24 w-96 max-w-[calc(100vw-2rem)] max-h-[calc(100vh-7rem)]'
@@ -323,12 +328,16 @@ export const AIFlightAssistantDrawer: React.FC<AIFlightAssistantDrawerProps> = (
                                   </span>
                                 </div>
                                 <div className="flex items-center gap-2 mt-1 text-[11px] text-slate-300 font-medium">
-                                  <span className="font-mono text-cyan-300">{flight.origin.code}</span>
-                                  <Plane className="w-3 h-3 text-slate-500 transform rotate-90" />
-                                  <span className="font-mono text-emerald-300">{flight.destination.code}</span>
-                                  <span className="text-slate-500 text-[10px]">
-                                    ({flight.origin.city} ➔ {flight.destination.city})
-                                  </span>
+                                  {flight.routeKnown === false ? (
+                                    <span className="text-slate-500">Route unknown</span>
+                                  ) : (
+                                    <>
+                                      <span className="font-mono text-cyan-300">{flight.origin.code}</span>
+                                      <Plane className="w-3 h-3 text-slate-500 transform rotate-90" />
+                                      <span className="font-mono text-emerald-300">{flight.destination.code}</span>
+                                      <span className="text-slate-500 text-[10px]">(estimated)</span>
+                                    </>
+                                  )}
                                 </div>
                               </div>
 
@@ -336,10 +345,12 @@ export const AIFlightAssistantDrawer: React.FC<AIFlightAssistantDrawerProps> = (
                                 className={`text-[9px] font-mono px-1.5 py-0.5 rounded font-semibold uppercase shrink-0 ${
                                   isDelayed
                                     ? 'bg-amber-500/20 text-amber-300 border border-amber-500/40'
+                                    : flight.status === 'unknown'
+                                      ? 'bg-slate-500/20 text-slate-300 border border-slate-500/40'
                                     : 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/40'
                                 }`}
                               >
-                                {isDelayed ? `Delayed +${flight.delayMinutes}m` : 'On Time'}
+                                {isDelayed ? `Delayed +${flight.delayMinutes}m` : flight.status === 'unknown' ? 'Telemetry only' : 'On Time'}
                               </div>
                             </div>
 
@@ -347,7 +358,7 @@ export const AIFlightAssistantDrawer: React.FC<AIFlightAssistantDrawerProps> = (
                             <div className="flex items-center justify-between text-[10px] font-mono text-slate-400 mt-2 pt-1.5 border-t border-slate-800/80">
                               <div>FL{Math.round(flight.altitude / 100)} · {flight.velocity} kts</div>
                               <div className="text-slate-300">
-                                ETA: {convertUtcTimeString(flight.arrivalEstimated, timezone || 'UTC')}
+                                {flight.arrivalEstimated ? `Direct ETA: ${convertUtcTimeString(flight.arrivalEstimated, timezone || 'UTC')}` : 'ETA unavailable'}
                               </div>
                             </div>
 

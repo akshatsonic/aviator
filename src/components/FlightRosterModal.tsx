@@ -91,7 +91,7 @@ export const FlightRosterModal: React.FC<FlightRosterModalProps> = ({
           <div className="flex items-center gap-2">
             <Plane className="w-4 h-4 text-cyan-400" />
             <h2 className="text-sm font-bold text-white tracking-wide">
-              Global Airspace Flight Directory ({filteredFlights.length} tracked)
+              Aircraft directory · {filteredFlights.length} tracked
             </h2>
           </div>
           <button
@@ -218,25 +218,33 @@ export const FlightRosterModal: React.FC<FlightRosterModalProps> = ({
                       {flight.airline}
                     </td>
                     <td className="py-2.5 px-4">
-                      <span className="text-cyan-300">{flight.origin.code}</span>
-                      <span className="text-slate-500 mx-1.5">➔</span>
-                      <span className="text-emerald-300">{flight.destination.code}</span>
+                      {flight.routeKnown === false ? (
+                        <span className="text-slate-500">Unknown</span>
+                      ) : (
+                        <>
+                          <span className="text-cyan-300">{flight.origin.code}</span>
+                          <span className="text-slate-500 mx-1.5">➔</span>
+                          <span className="text-emerald-300">{flight.destination.code}</span>
+                        </>
+                      )}
                     </td>
                     <td className="py-2.5 px-4 text-right tabular-nums">
-                      FL{Math.round(flight.altitude / 100)} ({flight.altitude.toLocaleString()} ft)
+                      {flight.altitudeAvailable === false ? '—' : `FL${Math.round(flight.altitude / 100)} (${flight.altitude.toLocaleString()} ft)`}
                     </td>
                     <td className="py-2.5 px-4 text-right tabular-nums">
-                      {flight.velocity} kts
+                      {flight.velocityAvailable === false ? '—' : `${flight.velocity} kts`}
                     </td>
                     <td className="py-2.5 px-4 text-right">
                       <span
                         className={`text-[10px] font-mono px-2 py-0.5 rounded font-semibold uppercase ${
                           isDelayed
                             ? 'bg-amber-500/20 text-amber-300 border border-amber-500/40'
+                            : flight.status === 'unknown'
+                              ? 'bg-slate-500/20 text-slate-300 border border-slate-500/40'
                             : 'bg-emerald-500/20 text-emerald-300 border border-emerald-500/40'
                         }`}
                       >
-                        {isDelayed ? `Delayed +${flight.delayMinutes}m` : 'On Time'}
+                        {isDelayed ? `Delayed +${flight.delayMinutes}m` : flight.status === 'unknown' ? 'Telemetry only' : 'On Time'}
                       </span>
                     </td>
                     <td className="py-2.5 px-4 text-center">

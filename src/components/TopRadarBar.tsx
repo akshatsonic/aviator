@@ -1,5 +1,5 @@
 import React from 'react';
-import { Plane, Search, Sparkles, Table2, Layers, RotateCcw } from 'lucide-react';
+import { Plane, Search, Sparkles, List, RotateCcw, X } from 'lucide-react';
 
 interface TopRadarBarProps {
   searchQuery: string;
@@ -25,92 +25,44 @@ export const TopRadarBar: React.FC<TopRadarBarProps> = ({
   selectedAirline,
   onSelectAirline,
   availableAirlines,
-}) => {
-  return (
-    <header className="relative z-40 flex items-center justify-between gap-6 px-6 py-3 bg-[#0B0F17] border-b border-slate-800/80 shrink-0">
-      {/* Zone 1: Single text element wordmark */}
-      <div className="flex items-center gap-3 shrink-0">
-        <div className="w-8 h-8 rounded-lg bg-cyan-950/80 border border-cyan-500/40 flex items-center justify-center text-cyan-400 shadow-[0_0_12px_rgba(56,189,248,0.2)]">
-          <Plane className="w-4 h-4 transform -rotate-45" />
-        </div>
-        <a href="/" className="text-base font-bold tracking-tight text-white flex items-center gap-2 whitespace-nowrap shrink-0">
-          SkyPulse <span className="text-cyan-400 font-normal">Radar</span>
-        </a>
-      </div>
+}) => (
+  <header className="app-header relative z-40 flex h-16 shrink-0 items-center gap-3 border-b border-white/8 bg-[#0a0a0a] px-4 sm:px-5">
+    <button onClick={onResetView} className="brand-mark flex shrink-0 items-center gap-2.5 text-left" title="Reset map and filters">
+      <span className="flex size-8 items-center justify-center rounded-lg bg-[#b11226] text-white">
+        <Plane className="size-4 -rotate-45" strokeWidth={2} />
+      </span>
+      <span className="hidden sm:block">
+        <span className="block text-sm font-semibold tracking-[-0.02em] text-[#efefef]">SkyPulse</span>
+        <span className="block text-[11px] text-[#8c8c8c]">Live airspace</span>
+      </span>
+    </button>
 
-      {/* Zone 2: Navigation Links & Airline Filter */}
-      <nav className="hidden md:flex items-center gap-6 text-sm font-medium text-slate-400">
-        <button
-          onClick={onResetView}
-          className="hover:text-cyan-300 transition-colors flex items-center gap-1.5 whitespace-nowrap shrink-0"
-        >
-          <RotateCcw className="w-3.5 h-3.5 text-slate-400" />
-          <span>Global Airspace</span>
+    <div className="relative mx-auto w-full max-w-xl">
+      <Search className="pointer-events-none absolute left-3 top-1/2 size-4 -translate-y-1/2 text-[#737373]" />
+      <input
+        type="search"
+        aria-label="Search flights"
+        placeholder="Search callsign, airline, airport…"
+        value={searchQuery}
+        onChange={(event) => onSearchChange(event.target.value)}
+        className="h-10 w-full rounded-xl border border-white/8 bg-[#151515] pl-10 pr-10 text-[13px] text-[#efefef] outline-none placeholder:text-[#737373] focus:border-[#b11226]"
+      />
+      {searchQuery && (
+        <button onClick={() => onSearchChange('')} className="absolute right-2 top-1/2 flex size-7 -translate-y-1/2 items-center justify-center rounded-lg text-[#8c8c8c] hover:bg-white/6 hover:text-white" aria-label="Clear search">
+          <X className="size-3.5" />
         </button>
+      )}
+    </div>
 
-        <button
-          onClick={onToggleRoster}
-          className={`hover:text-cyan-300 transition-colors flex items-center gap-1.5 whitespace-nowrap shrink-0 ${
-            isRosterOpen ? 'text-cyan-400 font-semibold' : ''
-          }`}
-        >
-          <Table2 className="w-3.5 h-3.5 text-slate-400" />
-          <span>Flight Directory</span>
-        </button>
+    <select value={selectedAirline} onChange={(event) => onSelectAirline(event.target.value)} aria-label="Filter by airline" className="hidden h-10 max-w-44 rounded-xl border border-white/8 bg-[#151515] px-3 text-[13px] text-[#b8b8b8] outline-none focus:border-[#b11226] lg:block">
+      <option value="all">All airlines</option>
+      {availableAirlines.map((airline) => <option key={airline} value={airline}>{airline}</option>)}
+    </select>
 
-        {/* Airline Selector */}
-        <div className="flex items-center gap-1.5 text-xs text-slate-300">
-          <Layers className="w-3.5 h-3.5 text-slate-400 shrink-0" />
-          <select
-            value={selectedAirline}
-            onChange={(e) => onSelectAirline(e.target.value)}
-            className="bg-slate-900 border border-slate-800 rounded px-2 py-1 text-slate-200 text-xs focus:outline-none focus:border-cyan-500/60"
-          >
-            <option value="all">All Airlines</option>
-            {availableAirlines.map((airline) => (
-              <option key={airline} value={airline}>
-                {airline}
-              </option>
-            ))}
-          </select>
-        </div>
-      </nav>
-
-      {/* Zone 3: Search & Primary Action */}
-      <div className="flex items-center gap-3 shrink-0">
-        {/* Quick Search */}
-        <div className="relative w-44 sm:w-56">
-          <Search className="w-3.5 h-3.5 absolute left-3 top-1/2 -translate-y-1/2 text-slate-400 pointer-events-none" />
-          <input
-            type="text"
-            placeholder="Flight #, airline, airport..."
-            value={searchQuery}
-            onChange={(e) => onSearchChange(e.target.value)}
-            className="w-full bg-slate-900/90 border border-slate-800 rounded-lg pl-8 pr-3 py-1.5 text-xs text-slate-200 placeholder-slate-500 focus:outline-none focus:border-cyan-500/60 transition-colors"
-          />
-          {searchQuery && (
-            <button
-              onClick={() => onSearchChange('')}
-              className="absolute right-2 top-1/2 -translate-y-1/2 text-slate-400 hover:text-slate-200 text-xs px-1"
-            >
-              ×
-            </button>
-          )}
-        </div>
-
-        {/* Primary Action Button: Toggle AI Copilot */}
-        <button
-          onClick={onToggleAiDrawer}
-          className={`flex items-center gap-2 px-3.5 py-1.5 rounded-lg text-xs font-medium transition-all shadow-sm whitespace-nowrap shrink-0 ${
-            isAiDrawerOpen
-              ? 'bg-cyan-500 text-slate-950 font-semibold shadow-[0_0_15px_rgba(56,189,248,0.35)]'
-              : 'bg-cyan-950/70 border border-cyan-500/40 text-cyan-300 hover:bg-cyan-900/60 hover:border-cyan-400'
-          }`}
-        >
-          <Sparkles className="w-3.5 h-3.5" />
-          <span>AI Copilot</span>
-        </button>
-      </div>
-    </header>
-  );
-};
+    <div className="flex shrink-0 items-center gap-1.5">
+      <button onClick={onResetView} className="icon-button hidden sm:flex" title="Reset view" aria-label="Reset view"><RotateCcw className="size-4" /></button>
+      <button onClick={onToggleRoster} className={`icon-button ${isRosterOpen ? 'is-active' : ''}`} title="Flight directory" aria-label="Open flight directory"><List className="size-4" /></button>
+      <button onClick={onToggleAiDrawer} className={`primary-button h-10 ${isAiDrawerOpen ? 'is-active' : ''}`}><Sparkles className="size-4" /><span className="hidden sm:inline">Ask AI</span></button>
+    </div>
+  </header>
+);

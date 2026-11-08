@@ -22,6 +22,29 @@ app.use(express.json());
 const flightEngine = new FlightEngine();
 const openSkyService = new OpenSkyService();
 
+function summarizeFlights(flights: Flight[]) {
+  const count = flights.length;
+  const flightsWithAltitude = flights.filter((flight) => flight.altitudeAvailable !== false);
+  const flightsWithVelocity = flights.filter((flight) => flight.velocityAvailable !== false);
+  return {
+    totalAirborne: count,
+    totalTracked: count,
+    onTimeCount: flights.filter((flight) => flight.status === 'on_time').length,
+    delayedCount: flights.filter((flight) => flight.status === 'delayed').length,
+    avgAltitude: flightsWithAltitude.length ? Math.round(flightsWithAltitude.reduce((sum, flight) => sum + flight.altitude, 0) / flightsWithAltitude.length) : 0,
+    avgVelocity: flightsWithVelocity.length ? Math.round(flightsWithVelocity.reduce((sum, flight) => sum + flight.velocity, 0) / flightsWithVelocity.length) : 0,
+    lastUpdated: new Date().toISOString(),
+  };
+}
+
+function parseBounds(query: express.Request['query']): { lamin: number; lomin: number; lamax: number; lomax: number } | undefined {
+  const values = ['lamin', 'lomin', 'lamax', 'lomax'].map((key) => Number(query[key]));
+  if (values.some((value) => !Number.isFinite(value))) return undefined;
+  const [lamin, lomin, lamax, lomax] = values;
+  if (lamin >= lamax || lomin >= lomax || lamin < -90 || lamax > 90 || lomin < -180 || lomax > 180) return undefined;
+  return { lamin, lomin, lamax, lomax };
+}
+
 // Tick the dead-reckoning engine every 2.5 seconds
 setInterval(() => {
   flightEngine.tick();
@@ -41,9 +64,13 @@ if (process.env.GEMINI_API_KEY) {
 }
 
 // REST Endpoint: Get live tracked flights & airspace summary
-app.get('/api/flights', (_req, res) => {
-  const flights = flightEngine.getFlights();
-  const summary = flightEngine.getSummary();
+app.get('/api/flights', (req, res) => {
+  const bbox = parseBounds(req.query);
+  const flights = flightEngine.getFlights().filter((flight) => !bbox || (
+    flight.latitude >= bbox.lamin && flight.latitude <= bbox.lamax &&
+    flight.longitude >= bbox.lomin && flight.longitude <= bbox.lomax
+  ));
+  const summary = summarizeFlights(flights);
   res.json({ flights, summary });
 });
 
@@ -52,43 +79,44 @@ app.get('/api/opensky/status', (_req, res) => {
   res.json(openSkyService.getRateLimitStatus());
 });
 
+app.get('/api/opensky/track/:icao24', async (req, res) => {
+  const track = await openSkyService.fetchLiveTrack(req.params.icao24);
+  res.json(track);
+});
+
+app.get('/api/routes/:callsign', async (req, res) => {
+  const lat = Number(req.query.lat);
+  const lng = Number(req.query.lng);
+  const route = await openSkyService.resolveRouteNow(req.params.callsign, lat, lng);
+  if (!route) {
+    res.status(404).json({ routeKnown: false });
+    return;
+  }
+  res.json({ routeKnown: true, routeSource: 'callsign_estimate', ...route });
+});
+
 // Configure or update OpenSky credentials dynamically
-app.post('/api/opensky/credentials', (req, res) => {
-  const { clientId, clientSecret, username, password } = req.body || {};
-  openSkyService.setCredentials({ clientId, clientSecret, username, password });
+app.post('/api/opensky/credentials', async (req, res) => {
+  const { clientId, clientSecret } = req.body || {};
+  openSkyService.setCredentials({ clientId, clientSecret });
+  const valid = await openSkyService.validateCredentials();
+  if (!valid) {
+    res.status(401).json({ success: false, error: 'OpenSky rejected these OAuth credentials' });
+    return;
+  }
   res.json({ success: true, ...openSkyService.getRateLimitStatus() });
 });
 
 // Fetch Live OpenSky Flights (supports optional bounding box lamin, lomin, lamax, lomax)
 app.get('/api/opensky/live', async (req, res) => {
-  const { lamin, lomin, lamax, lomax } = req.query;
-  let bbox: { lamin: number; lomin: number; lamax: number; lomax: number } | undefined = undefined;
-
-  if (lamin && lomin && lamax && lomax) {
-    const parsedLamin = parseFloat(lamin as string);
-    const parsedLomin = parseFloat(lomin as string);
-    const parsedLamax = parseFloat(lamax as string);
-    const parsedLomax = parseFloat(lomax as string);
-    if (!isNaN(parsedLamin) && !isNaN(parsedLomin) && !isNaN(parsedLamax) && !isNaN(parsedLomax)) {
-      bbox = { lamin: parsedLamin, lomin: parsedLomin, lamax: parsedLamax, lomax: parsedLomax };
-    }
-  }
+  const bbox = parseBounds(req.query);
 
   const liveResult = await openSkyService.fetchLiveStates(bbox);
-  if (liveResult.flights.length > 0) {
-    res.json(liveResult);
+  if (liveResult.isLive) {
+    res.json({ ...liveResult, summary: summarizeFlights(liveResult.flights) });
   } else {
-    // If live returns 0 flights or error/rate-limited, return simulated with isLive: false
-    const fallbackFlights = flightEngine.getFlights();
-    const summary = flightEngine.getSummary();
-    res.json({
-      flights: fallbackFlights,
-      summary,
-      creditsRemaining: liveResult.creditsRemaining,
-      dailyAllowance: liveResult.dailyAllowance,
-      isLive: false,
-      error: liveResult.error || 'Viewing high-density tactical airspace radar',
-    });
+    // Keep the last live positions in the client rather than silently substituting simulation data.
+    res.json(liveResult);
   }
 });
 
@@ -229,6 +257,15 @@ function findRelevantAirspaceFlights(query: string, allFlights: Flight[]): {
 // Generate intelligent fallback response
 function generateFallbackChatResponse(query: string, flights: Flight[]) {
   const q = query.toLowerCase();
+  const routeLabel = (flight: Flight) => flight.routeKnown === false
+    ? 'Route unavailable'
+    : `${flight.origin.city} (${flight.origin.code}) ➔ ${flight.destination.city} (${flight.destination.code})${flight.routeSource === 'callsign_estimate' ? ' (callsign-derived estimate)' : ''}`;
+  const statusLabel = (flight: Flight) => flight.status === 'delayed'
+    ? `Delayed +${flight.delayMinutes}m`
+    : flight.status === 'unknown' ? 'Schedule status unavailable' : 'On Time';
+  const etaLabel = (flight: Flight) => flight.arrivalEstimated
+    ? `${flight.arrivalEstimated}${flight.etaType === 'direct_estimate' ? ' UTC (direct estimate)' : ''}`
+    : 'Unavailable';
 
   // Check for OpenSky tracking mechanism inquiry
   if (q.includes('opensky') || q.includes('how do they') || q.includes('how do they do that') || q.includes('track all') || q.includes('10615') || q.includes('10,615') || q.includes('on screen')) {
@@ -236,7 +273,7 @@ function generateFallbackChatResponse(query: string, flights: Flight[]) {
     return {
       reply: `### How OpenSky Tracks 10,000+ Aircraft Simultaneously\n\n1. **Crowdsourced 1090 MHz SDR Feeders**: OpenSky does not own a giant radar. Instead, thousands of aviation volunteers worldwide connect low-cost USB Software Defined Radios (RTL-SDR dongles on Raspberry Pis) tuned to **1090 MHz**. Commercial planes broadcast unencrypted **Mode-S ADS-B** signals containing their GPS position, altitude, squawk, and airspeed twice every second.\n2. **readsb Ingestion Engine**: OpenSky servers collect all binary packets from these volunteer antennas, deduplicate them, and dump a global JSON file (\`aircraft.json\`) containing every transponder active in the world (~10,600+).\n3. **tar1090 "On Screen" vs "Total"**: The browser downloads the snapshot and checks each aircraft's coordinates against your visible map rectangle (\`bounds.contains(lat, lon)\`). If you zoom into Europe, the "On Screen" count drops from 10,000 to ~3,000.\n4. **Why public apps can't fetch all 10,615 directly**: Notice the yellow **401 - session expired / rate limit** error in the OpenSky screenshot. OpenSky heavily rate-limits or blocks unauthorized automated API access from datacenter IPs. That's why SkyPulse runs an ultra-high density internal dead-reckoning engine with 1,650+ airborne aircraft and dynamic viewport culling.`,
       matchedFlightNumbers: featured,
-      suggestedQueries: ['Show London Heathrow arrivals', 'Which flights are delayed?', 'Track flight EK201'],
+      suggestedQueries: ['Show aircraft near London', 'Which aircraft are moving fastest?', 'Explain OpenSky tracks'],
     };
   }
 
@@ -246,44 +283,45 @@ function generateFallbackChatResponse(query: string, flights: Flight[]) {
   if (relevant.length === 1 && (q.includes(relevant[0].flightNumber.toLowerCase()) || q.includes(relevant[0].callsign.toLowerCase()))) {
     const f = relevant[0];
     return {
-      reply: `**Flight ${f.flightNumber}** (${f.airline}) is currently airborne at **FL${Math.round(f.altitude / 100)}** (${f.altitude.toLocaleString()} ft) cruising at **${f.velocity} kts** on heading **${f.heading}°**.\n\n• **Route**: ${f.origin.city} (${f.origin.code}) ➔ ${f.destination.city} (${f.destination.code})\n• **Aircraft**: ${f.aircraftType} (${f.registration})\n• **Status**: ${f.status === 'delayed' ? `Delayed +${f.delayMinutes}m` : 'On Time'}\n• **Progress**: ${f.progressPercent}% completed (ETA ${f.arrivalEstimated})\n\nClick the card below to lock onto this aircraft on the radar map.`,
+      reply: `**Flight ${f.flightNumber}** (${f.airline}) is currently observed at **FL${Math.round(f.altitude / 100)}** (${f.altitude.toLocaleString()} ft), moving at **${f.velocity} kts** on true track **${f.heading}°**.\n\n• **Route**: ${routeLabel(f)}\n• **Aircraft type**: ${f.aircraftType}\n• **Schedule status**: ${statusLabel(f)}\n• **ETA**: ${etaLabel(f)}\n\nClick the card below to lock onto this aircraft on the radar map.`,
       matchedFlightNumbers: [f.flightNumber],
-      suggestedQueries: [`Show flights enroute to ${f.destination.code}`, 'Show delayed flights', 'Check airport arrivals'],
+      suggestedQueries: ['Show aircraft in this viewport', 'What telemetry does OpenSky provide?', 'Explain this aircraft track'],
     };
   }
 
   // If multiple flights matched (e.g. enroute to BLR, or delayed)
   if (relevant.length > 0 && matchedNumbers.length > 0 && contextDescription !== 'monitored global flights') {
     const listSummary = relevant.slice(0, 5).map(f =>
-      `• **${f.flightNumber}** (${f.airline}): ${f.origin.code} ➔ ${f.destination.code} | FL${Math.round(f.altitude / 100)} (${f.altitude.toLocaleString()} ft) · ${f.velocity} kts · ${f.status === 'delayed' ? `Delayed +${f.delayMinutes}m` : 'On Time'} (ETA ${f.arrivalEstimated})`
+      `• **${f.flightNumber}** (${f.airline}): ${routeLabel(f)} | FL${Math.round(f.altitude / 100)} · ${f.velocity} kts · ${statusLabel(f)} · ETA ${etaLabel(f)}`
     ).join('\n');
 
     return {
       reply: `Found **${relevant.length} active flights** ${contextDescription}:\n\n${listSummary}\n\nYou can click on any flight card below to center and lock onto it directly on the tactical radar.`,
       matchedFlightNumbers: matchedNumbers,
-      suggestedQueries: ['Are any of these delayed?', 'What is the fastest flight?', 'Show global delayed flights'],
+      suggestedQueries: ['What is the fastest aircraft?', 'Which one is highest?', 'Explain these route estimates'],
     };
   }
 
   // General overview
   const featured = flights.slice(0, 3).map(f => f.flightNumber);
   return {
-    reply: `SkyPulse is monitoring **${flights.length} active flights** worldwide across international airways with a global fleet of **10,615 aircraft**. I can provide instant updates on arrivals, departures, delays, altitudes, and speeds. Ask about any airport (e.g., BLR, BOM, DEL, LHR, JFK), airline, or flight number:`,
+    reply: `SkyPulse currently has **${flights.length} aircraft** loaded. I can report observed position, altitude, ground speed, true track, vertical rate, and callsign-derived route estimates when available. OpenSky does not provide live airline schedules or delay status.`,
     matchedFlightNumbers: featured,
-    suggestedQueries: ['Which flights are enroute to BLR?', 'Which flights are delayed?', 'Show arrivals to London (LHR)'],
+    suggestedQueries: ['Which aircraft are moving fastest?', 'Show available BLR route estimates', 'Explain OpenSky telemetry'],
   };
 }
 
 // REST Endpoint: AI Airspace Copilot Chat (using gemini-3.1-flash-lite)
 app.post('/api/ai/chat', async (req, res) => {
   try {
-    const { message } = req.body;
+    const { message, useLiveData } = req.body;
     if (!message || typeof message !== 'string') {
       res.status(400).json({ error: 'Message is required' });
       return;
     }
 
-    const currentFlights = flightEngine.getFlights();
+    const liveFlights = useLiveData ? openSkyService.getCachedFlights() : [];
+    const currentFlights = useLiveData ? liveFlights : flightEngine.getFlights();
 
     // If Gemini client is not initialized, use intelligent local aviation engine
     if (!aiClient) {
@@ -313,10 +351,14 @@ app.post('/api/ai/chat', async (req, res) => {
       delayMinutes: f.delayMinutes,
       eta: f.arrivalEstimated,
       progressPercent: f.progressPercent,
+      routeKnown: f.routeKnown !== false,
+      routeSource: f.routeSource,
+      etaType: f.etaType,
+      scheduleKnown: f.scheduleKnown !== false,
     }));
 
     const systemInstruction = `You are SkyPulse Airspace Copilot, an expert tactical flight intelligence assistant integrated into a real-time world radar.
-Your role is to answer user inquiries about flight locations, departures, arrivals, delays, altitudes, speeds, and airspace statistics.
+Your role is to answer user inquiries about available aircraft positions, route estimates, altitudes, speeds, tracks, and airspace statistics.
 Always accurately report flights based on the provided live snapshot. If the user asks about flights en route to an airport (e.g. BLR, Bangalore, LHR, JFK), check the destinationCode and destination city in the snapshot and list them clearly.
 
 CURRENT MONITORED AIRSPACE FLIGHTS SNAPSHOT:
@@ -324,8 +366,9 @@ ${JSON.stringify(flightSnapshot, null, 2)}
 
 INSTRUCTIONS:
 1. Provide accurate, clear, and concise aviation intelligence based on the snapshot.
-2. In your reply, list the flight numbers, airline, route, altitude, and ETA.
-3. Respond in strict JSON format:
+2. Report only fields available in the snapshot. Never infer a route, schedule status, delay, aircraft type, or ETA.
+3. A callsign-derived route and a direct ETA are estimates, not a filed flight plan or airline ETA. Label them clearly.
+4. Respond in strict JSON format:
 {
   "reply": "Markdown formatted conversational answer.",
   "matchedFlightNumbers": ["Array", "of", "matching", "flightNumbers", "e.g. SK1907"],
