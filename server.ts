@@ -116,8 +116,14 @@ app.get('/api/opensky/live', async (req, res) => {
 
   const liveResult = await openSkyService.fetchLiveStates(bbox);
   if (liveResult.isLive) {
+    if (liveResult.provider === 'adsb.lol') {
+      res.setHeader('Cache-Control', 'public, s-maxage=20, stale-while-revalidate=60');
+    } else {
+      res.setHeader('Cache-Control', 'private, no-store');
+    }
     res.json({ ...liveResult, summary: summarizeFlights(liveResult.flights) });
   } else {
+    res.setHeader('Cache-Control', 'no-store');
     // Keep the last live positions in the client rather than silently substituting simulation data.
     res.json(liveResult);
   }
@@ -323,7 +329,12 @@ app.post('/api/ai/chat', async (req, res) => {
       return;
     }
 
-    const liveFlights = useLiveData ? openSkyService.getCachedFlights() : [];
+    const suppliedFlights = Array.isArray(req.body?.flights)
+      ? req.body.flights.filter((flight: Flight) => flight && typeof flight.id === 'string').slice(0, 60) as Flight[]
+      : [];
+    const liveFlights = useLiveData
+      ? (suppliedFlights.length > 0 ? suppliedFlights : openSkyService.getCachedFlights())
+      : [];
     const currentFlights = useLiveData ? liveFlights : flightEngine.getFlights();
 
     // If Gemini client is not initialized, use intelligent local aviation engine
@@ -408,7 +419,13 @@ INSTRUCTIONS:
     }
   } catch (error) {
     console.warn('AI chat falling back to local intelligence engine:', (error as Error).message);
-    const currentFlights = flightEngine.getFlights();
+    const requestedLiveData = Boolean(req.body?.useLiveData);
+    const suppliedFlights = Array.isArray(req.body?.flights)
+      ? req.body.flights.filter((flight: Flight) => flight && typeof flight.id === 'string').slice(0, 60) as Flight[]
+      : [];
+    const currentFlights = requestedLiveData
+      ? (suppliedFlights.length > 0 ? suppliedFlights : openSkyService.getCachedFlights())
+      : flightEngine.getFlights();
     const fallback = generateFallbackChatResponse(req.body?.message || '', currentFlights);
     res.json(fallback);
   }

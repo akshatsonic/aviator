@@ -8,6 +8,7 @@ interface AIFlightAssistantDrawerProps {
   isOpen: boolean;
   onClose: () => void;
   flights: Flight[];
+  useLiveData: boolean;
   onFocusFlight: (flightId: string) => void;
   prefilledQuery?: string;
   onClearPrefill?: () => void;
@@ -25,6 +26,7 @@ export const AIFlightAssistantDrawer: React.FC<AIFlightAssistantDrawerProps> = (
   isOpen,
   onClose,
   flights,
+  useLiveData,
   onFocusFlight,
   prefilledQuery,
   onClearPrefill,
@@ -34,9 +36,8 @@ export const AIFlightAssistantDrawer: React.FC<AIFlightAssistantDrawerProps> = (
     {
       id: 'welcome',
       sender: 'assistant',
-      text: "Hello! I'm your **SkyPulse Airspace Copilot**. Ask me about aircraft position, altitude, speed, true track, or available route estimates. OpenSky telemetry does not include airline schedules or delay status.",
+      text: "I'm the **SkyPulse Airspace Copilot**. Ask about aircraft position, altitude, speed, true track, or available route estimates. OpenSky telemetry does not include airline schedules or delay status.",
       timestamp: new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }),
-      matchedFlightNumbers: ['EK201', 'DL405', 'BA117'],
       suggestedQueries: [
         'Which aircraft have the highest altitude?',
         'Show Tokyo (HND) route estimates',
@@ -93,7 +94,8 @@ export const AIFlightAssistantDrawer: React.FC<AIFlightAssistantDrawerProps> = (
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
           message: queryText,
-          useLiveData: flights.some((flight) => flight.dataSource === 'opensky'),
+          useLiveData,
+          flights: flights.slice(0, 60).map(({ trail: _trail, ...flight }) => flight),
         }),
         signal: controller.signal,
       });
@@ -167,7 +169,9 @@ export const AIFlightAssistantDrawer: React.FC<AIFlightAssistantDrawerProps> = (
       if (!reply) {
         const sample = flights.slice(0, 3);
         matchedNumbers = sample.map(f => f.flightNumber);
-        reply = `SkyPulse is monitoring **${flights.length} active flights** globally. Here are active flights in monitored airspace. Ask about any airport (e.g., BLR, BOM, DEL, LHR), airline, or delays:`;
+        reply = flights.length > 0
+          ? `SkyPulse has **${flights.length} aircraft** loaded in the monitored area. Ask about a callsign, airport, altitude, or speed.`
+          : 'There are currently **no aircraft loaded** on the radar. Retry the live feed or search a wider area before asking about a specific flight.';
       }
 
       const assistantMsg: ChatMessage = {
@@ -218,10 +222,10 @@ export const AIFlightAssistantDrawer: React.FC<AIFlightAssistantDrawerProps> = (
   return (
     <aside
       onClick={(e) => e.stopPropagation()}
-      className={`assistant-panel fixed left-4 z-[1050] flex flex-col overflow-hidden transition-all duration-200 ${
+      className={`assistant-panel absolute right-4 z-[1050] flex flex-col overflow-hidden transition-all duration-200 ${
         isMinimized
-          ? 'bottom-4 w-80 h-13'
-          : 'bottom-4 top-24 w-96 max-w-[calc(100vw-2rem)] max-h-[calc(100vh-7rem)]'
+          ? 'bottom-4 h-13 w-80'
+          : 'bottom-4 top-4 w-[400px] max-w-[calc(100vw-2rem)]'
       }`}
     >
       {/* Header */}
@@ -233,10 +237,10 @@ export const AIFlightAssistantDrawer: React.FC<AIFlightAssistantDrawerProps> = (
           <div>
             <h2 className="text-xs font-bold text-white tracking-tight flex items-center gap-1.5">
               Airspace Copilot
-              <span className="text-[10px] font-mono text-cyan-400/90 font-normal">Gemini 3.1 Flash Lite</span>
+              <span className="text-[10px] font-mono text-[#737373] font-normal">Gemini</span>
             </h2>
             {!isMinimized && (
-              <div className="text-[10px] text-slate-400">Live arrivals, departures & delay intelligence</div>
+              <div className="text-[10px] text-slate-400">Position, speed, altitude, and route estimates</div>
             )}
           </div>
         </div>
@@ -274,6 +278,9 @@ export const AIFlightAssistantDrawer: React.FC<AIFlightAssistantDrawerProps> = (
           <div className="flex-1 overflow-y-auto p-3.5 space-y-3 text-xs">
             {messages.map((msg) => {
               const isUser = msg.sender === 'user';
+              const matchedFlights = (msg.matchedFlightNumbers || [])
+                .map(getFlightByNumber)
+                .filter((flight): flight is Flight => Boolean(flight));
               return (
                 <div
                   key={msg.id}
@@ -302,14 +309,12 @@ export const AIFlightAssistantDrawer: React.FC<AIFlightAssistantDrawerProps> = (
                   </div>
 
                   {/* Embedded Interactive Flight Cards in Assistant Responses */}
-                  {!isUser && msg.matchedFlightNumbers && msg.matchedFlightNumbers.length > 0 && (
+                  {!isUser && matchedFlights.length > 0 && (
                     <div className="w-full mt-2 space-y-2">
                       <div className="text-[10px] font-mono uppercase tracking-wider text-cyan-400/80 px-1">
-                        Matching Flights ({msg.matchedFlightNumbers.length})
+                        Matching flights ({matchedFlights.length})
                       </div>
-                      {msg.matchedFlightNumbers.map((flightNum) => {
-                        const flight = getFlightByNumber(flightNum);
-                        if (!flight) return null;
+                      {matchedFlights.map((flight) => {
                         const isDelayed = flight.status === 'delayed';
 
                         return (
@@ -412,7 +417,7 @@ export const AIFlightAssistantDrawer: React.FC<AIFlightAssistantDrawerProps> = (
             <div className="relative flex items-center">
               <input
                 type="text"
-                placeholder="Ask about flights, delays, or arrivals..."
+                placeholder="Ask about a callsign, altitude, or airport…"
                 value={input}
                 onChange={(e) => setInput(e.target.value)}
                 onKeyDown={handleKeyDown}

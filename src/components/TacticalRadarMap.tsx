@@ -3,7 +3,7 @@ import L from 'leaflet';
 import { Flight } from '../types/flight.ts';
 import type { MapBounds, MapCenter } from '../App.tsx';
 import { TimezoneCode } from '../utils/time.ts';
-import { Crosshair, Plus, Minus, RotateCcw, Layers, X, TableProperties } from 'lucide-react';
+import { Crosshair, Plus, Minus, RotateCcw, Layers, X, TableProperties, RefreshCw, ScanSearch } from 'lucide-react';
 
 interface TacticalRadarMapProps {
   flights: Flight[];
@@ -13,6 +13,11 @@ interface TacticalRadarMapProps {
   initialCenter: MapCenter;
   initialRadiusKm?: number;
   scopeLabel?: string;
+  isLiveFeed?: boolean;
+  liveProvider?: 'opensky' | 'adsb.lol';
+  isLoading?: boolean;
+  feedError?: string | null;
+  onRetry?: () => void;
   radarSweepEnabled?: boolean;
   timezone?: TimezoneCode;
 }
@@ -93,6 +98,11 @@ export const TacticalRadarMap: React.FC<TacticalRadarMapProps> = ({
   initialCenter,
   initialRadiusKm = 100,
   scopeLabel = 'Local airspace',
+  isLiveFeed = false,
+  liveProvider = 'opensky',
+  isLoading = false,
+  feedError = null,
+  onRetry,
 }) => {
   const mapContainerRef = useRef<HTMLDivElement | null>(null);
   const mapInstanceRef = useRef<L.Map | null>(null);
@@ -480,6 +490,13 @@ export const TacticalRadarMap: React.FC<TacticalRadarMapProps> = ({
     map.flyToBounds(bounds, { padding: [32, 32], maxZoom: 9, duration: 0.8 });
   };
 
+  const handleExpandSearch = () => {
+    const map = mapInstanceRef.current;
+    if (!map) return;
+    const widerBounds = L.latLng(initialCenter.latitude, initialCenter.longitude).toBounds(700000);
+    map.flyToBounds(widerBounds, { padding: [32, 32], maxZoom: 7, duration: 0.8 });
+  };
+
   const selectedFlight = flights.find((f) => f.id === selectedFlightId);
   const isOpenSkyData = flights.some((flight) => flight.dataSource === 'opensky');
   const selectedIcao24 = selectedFlight?.dataSource === 'opensky' ? selectedFlight.icao24 : undefined;
@@ -543,10 +560,39 @@ export const TacticalRadarMap: React.FC<TacticalRadarMapProps> = ({
       {/* Map Container */}
       <div ref={mapContainerRef} className="w-full h-full" />
 
+      {!isLoading && flights.length === 0 && (
+        <div className="pointer-events-none absolute inset-0 z-[450] flex items-center justify-center px-4">
+          <div className="pointer-events-auto w-full max-w-sm rounded-xl border border-white/10 bg-[#111]/95 p-5 text-left shadow-2xl">
+            <div className="mb-4 flex size-9 items-center justify-center rounded-lg border border-white/10 bg-[#191919] text-[#b8b8b8]">
+              {feedError ? <RefreshCw className="size-4" /> : <ScanSearch className="size-4" />}
+            </div>
+            <h2 className="text-base font-medium tracking-[-0.02em] text-white">
+              {feedError ? 'Live flight feed unavailable' : 'No aircraft in this area'}
+            </h2>
+            <p className="mt-2 text-[13px] leading-5 text-[#8c8c8c]">
+              {feedError
+                ? feedError
+                : 'OpenSky reported no airborne aircraft inside the current map bounds. Search a wider area to continue.'}
+            </p>
+            <div className="mt-5 flex gap-2">
+              {feedError ? (
+                <button type="button" onClick={onRetry} className="primary-button">
+                  <RefreshCw className="size-3.5" /> Retry live feed
+                </button>
+              ) : (
+                <button type="button" onClick={handleExpandSearch} className="primary-button">
+                  <ScanSearch className="size-3.5" /> Search 350 km
+                </button>
+              )}
+            </div>
+          </div>
+        </div>
+      )}
+
       {/* OpenSky / tar1090 Aircraft Stats Counter Widget (Top Left, z-[500]) */}
       <div className="map-surface absolute top-4 left-4 z-[500] flex items-center gap-3 px-3 py-2 font-mono text-xs">
         <div>
-          <div className="text-[11px] text-[#737373] font-sans">{scopeLabel} · {isOpenSkyData ? 'OpenSky' : 'Simulation'}</div>
+          <div className="text-[11px] text-[#737373] font-sans">{scopeLabel} · {feedError ? 'Unavailable' : (isLiveFeed || isOpenSkyData) ? (liveProvider === 'adsb.lol' ? 'ADSB.lol' : 'OpenSky') : 'Simulation'}</div>
           <div className="flex items-center gap-2 mt-0.5">
             <span className="text-[#b8b8b8]">{flights.length} loaded</span>
             <span className="text-[#525252]">·</span>

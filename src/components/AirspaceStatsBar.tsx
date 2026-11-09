@@ -12,10 +12,12 @@ interface AirspaceStatsBarProps {
   onTimezoneChange: (tz: TimezoneCode) => void;
   isLiveFeed?: boolean;
   creditsRemaining?: number;
+  feedError?: string | null;
+  liveProvider?: 'opensky' | 'adsb.lol';
   onOpenOpenSkyModal?: () => void;
 }
 
-export const AirspaceStatsBar: React.FC<AirspaceStatsBarProps> = ({ summary, activeFilter, onFilterChange, filteredCount, timezone, onTimezoneChange, isLiveFeed = false, creditsRemaining = 4000, onOpenOpenSkyModal }) => {
+export const AirspaceStatsBar: React.FC<AirspaceStatsBarProps> = ({ summary, activeFilter, onFilterChange, filteredCount, timezone, onTimezoneChange, isLiveFeed = false, creditsRemaining = 4000, feedError = null, liveProvider = 'opensky', onOpenOpenSkyModal }) => {
   const [currentTime, setCurrentTime] = useState('');
   const [showTzMenu, setShowTzMenu] = useState(false);
 
@@ -37,9 +39,9 @@ export const AirspaceStatsBar: React.FC<AirspaceStatsBarProps> = ({ summary, act
     <div className="relative z-50 flex h-12 shrink-0 items-center justify-between gap-3 border-b border-white/8 bg-[#101010] px-4 sm:px-5">
       <div className="flex min-w-0 items-center gap-4">
         <button onClick={onOpenOpenSkyModal} className="flex shrink-0 items-center gap-2 text-[12px] font-medium text-[#b8b8b8] hover:text-white" title="OpenSky connection settings">
-          <span className={`size-1.5 rounded-full ${isLiveFeed ? 'bg-emerald-400' : 'bg-[#b11226]'}`} />
-          <span>{isLiveFeed ? 'OpenSky live' : 'Simulation'}</span>
-          {isLiveFeed && <span className="hidden font-mono text-[11px] text-[#737373] md:inline">{creditsRemaining} credits</span>}
+          <span className={`size-1.5 rounded-full ${isLiveFeed && !feedError ? 'bg-emerald-400' : 'bg-[#b11226]'}`} />
+          <span>{isLiveFeed ? (feedError ? 'Live feed unavailable' : liveProvider === 'adsb.lol' ? 'ADSB.lol live' : 'OpenSky live') : 'Simulation'}</span>
+          {isLiveFeed && !feedError && liveProvider === 'opensky' && <span className="hidden font-mono text-[11px] text-[#737373] md:inline">{creditsRemaining} credits</span>}
         </button>
         <span className="hidden h-4 w-px bg-white/8 sm:block" />
         <div className="hidden items-baseline gap-1.5 sm:flex">

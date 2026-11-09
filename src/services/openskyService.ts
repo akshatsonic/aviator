@@ -8,6 +8,7 @@ export interface OpenSkyCredentials {
 
 export interface OpenSkyLiveResponse {
   flights: Flight[];
+  provider: 'opensky' | 'adsb.lol';
   creditsRemaining: number;
   dailyAllowance: number;
   isLive: boolean;
@@ -22,6 +23,7 @@ export class OpenSkyService {
 
   private cachedAccessToken: string | null = null;
   private tokenExpiresAt: number = 0;
+  private accessTokenRequest: Promise<string | null> | null = null;
 
   // Track rate limits from OpenSky headers
   private creditsRemaining: number = 4000;
@@ -33,6 +35,7 @@ export class OpenSkyService {
     data: Flight[];
     timestamp: number;
     bboxKey: string;
+    provider: 'opensky' | 'adsb.lol';
   } | null = null;
 
   // Cache for callsign route resolution (callsign -> { origin, destination })
@@ -40,10 +43,16 @@ export class OpenSkyService {
   private routeLookupAttempts: Map<string, number> = new Map();
   private trailCache: Map<string, Array<[number, number]>> = new Map();
   private trackCache: Map<string, { path: Array<[number, number]>; timestamp: number }> = new Map();
+  private adsbLolRetryAt = 0;
+  private adsbLolBackoffMs = 15000;
 
   constructor() {
     this.clientId = process.env.OPENSKY_CLIENT_ID || '';
     this.clientSecret = process.env.OPENSKY_CLIENT_SECRET || '';
+  }
+
+  private shouldBypassOpenSky(): boolean {
+    return Boolean(process.env.VERCEL) || process.env.DISABLE_OPENSKY === 'true';
   }
 
   public setCredentials(creds: OpenSkyCredentials) {
@@ -59,6 +68,7 @@ export class OpenSkyService {
 
   public async validateCredentials(): Promise<boolean> {
     if (!this.hasCredentials()) return false;
+    if (this.shouldBypassOpenSky()) return true;
     return !!(await this.getAccessToken());
   }
 
@@ -87,6 +97,17 @@ export class OpenSkyService {
       return null;
     }
 
+    if (this.accessTokenRequest) return this.accessTokenRequest;
+
+    this.accessTokenRequest = this.requestAccessToken();
+    try {
+      return await this.accessTokenRequest;
+    } finally {
+      this.accessTokenRequest = null;
+    }
+  }
+
+  private async requestAccessToken(): Promise<string | null> {
     try {
       const tokenUrl = 'https://auth.opensky-network.org/auth/realms/opensky-network/protocol/openid-connect/token';
       const body = new URLSearchParams({
@@ -99,7 +120,7 @@ export class OpenSkyService {
         method: 'POST',
         headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
         body: body.toString(),
-        signal: AbortSignal.timeout(6000),
+        signal: AbortSignal.timeout(3500),
       });
 
       if (!res.ok) {
@@ -226,7 +247,12 @@ export class OpenSkyService {
         console.warn(`[Route lookup] ${new URL(url).hostname} returned HTTP ${response.status}`);
         return;
       }
-      const routes = await response.json();
+      const body = await response.text();
+      if (!body.trim()) {
+        console.warn(`[Route lookup] ${new URL(url).hostname} returned an empty response`);
+        return;
+      }
+      const routes = JSON.parse(body);
       if (Array.isArray(routes)) this.cacheRouteResults(routes);
     } catch (error: any) {
       console.warn(`[Route lookup] ${new URL(url).hostname} failed: ${error?.message || error}`);
@@ -282,10 +308,14 @@ export class OpenSkyService {
     const cached = this.routeCache.get(normalizedCallsign);
     if (cached) return cached;
 
+    const now = Date.now();
+    const previousAttempt = this.routeLookupAttempts.get(normalizedCallsign) || 0;
+    if (now - previousAttempt < 10 * 60 * 1000) return null;
+    this.routeLookupAttempts.set(normalizedCallsign, now);
+
     const plane = [{ callsign: normalizedCallsign, lat, lng }];
-    await this.queryRouteProvider('https://flightroutes.opensky-network.org/api/routeset', plane);
-    if (!this.routeCache.has(normalizedCallsign)) {
-      await this.queryRouteProvider('https://api.adsb.lol/api/0/routeset', plane);
+    if (!this.shouldBypassOpenSky()) {
+      await this.queryRouteProvider('https://flightroutes.opensky-network.org/api/routeset', plane);
     }
     if (!this.routeCache.has(normalizedCallsign)) {
       await this.queryAdsbDbRoutes(plane);
@@ -293,7 +323,7 @@ export class OpenSkyService {
     return this.routeCache.get(normalizedCallsign) || null;
   }
 
-  /** Resolve optional callsign routes, falling back to adsb.lol for unresolved aircraft. */
+  /** Resolve optional callsign routes, falling back to ADSBDB for unresolved aircraft. */
   public async enrichRoutes(planes: Array<{ callsign: string; lat: number; lng: number }>) {
     const retryAfterMs = 6 * 60 * 60 * 1000;
     const now = Date.now();
@@ -305,19 +335,25 @@ export class OpenSkyService {
     if (unknownPlanes.length === 0) return;
     unknownPlanes.forEach(({ callsign }) => this.routeLookupAttempts.set(callsign, now));
 
-    await this.queryRouteProvider('https://flightroutes.opensky-network.org/api/routeset', unknownPlanes);
+    if (!this.shouldBypassOpenSky()) {
+      await this.queryRouteProvider('https://flightroutes.opensky-network.org/api/routeset', unknownPlanes);
+    }
 
     const unresolvedPlanes = unknownPlanes.filter(({ callsign }) => !this.routeCache.has(callsign));
-    await this.queryRouteProvider('https://api.adsb.lol/api/0/routeset', unresolvedPlanes);
-
-    const stillUnresolvedPlanes = unresolvedPlanes.filter(({ callsign }) => !this.routeCache.has(callsign));
-    await this.queryAdsbDbRoutes(stillUnresolvedPlanes);
+    await this.queryAdsbDbRoutes(unresolvedPlanes);
   }
 
   public async fetchLiveTrack(icao24: string): Promise<{ path: Array<[number, number]>; lastUpdated: string; error?: string }> {
     const normalizedIcao24 = icao24.toLowerCase();
     if (!/^[0-9a-f]{6}$/.test(normalizedIcao24)) {
       return { path: [], lastUpdated: new Date().toISOString(), error: 'Invalid ICAO24 address' };
+    }
+
+    if (this.shouldBypassOpenSky()) {
+      return {
+        path: [...(this.trailCache.get(normalizedIcao24) || [])],
+        lastUpdated: new Date().toISOString(),
+      };
     }
 
     const cached = this.trackCache.get(normalizedIcao24);
@@ -371,11 +407,31 @@ export class OpenSkyService {
     if (this.cachedResponse && this.cachedResponse.bboxKey === bboxKey && now - this.cachedResponse.timestamp < 8000) {
       return {
         flights: this.cachedResponse.data,
+        provider: this.cachedResponse.provider,
         creditsRemaining: this.creditsRemaining,
         dailyAllowance: this.dailyAllowance,
         isLive: true,
         creditCost,
         lastUpdated: new Date(this.cachedResponse.timestamp).toISOString(),
+      };
+    }
+
+    // OpenSky documents that it may block hyperscaler egress IPs. Vercel uses
+    // shared cloud egress, so use the radius-bounded open ADSB.lol feed there.
+    if (this.shouldBypassOpenSky() && bbox) {
+      const cloudResult = await this.fetchAdsbLolStates(bbox, now, bboxKey);
+      if (cloudResult) return cloudResult;
+      return {
+        flights: [],
+        provider: 'adsb.lol',
+        creditsRemaining: this.creditsRemaining,
+        dailyAllowance: this.dailyAllowance,
+        isLive: false,
+        creditCost: 0,
+        lastUpdated: new Date(now).toISOString(),
+        error: this.adsbLolRetryAt > now
+          ? `ADSB.lol rate limit active. Retrying after ${new Date(this.adsbLolRetryAt).toLocaleTimeString()}.`
+          : 'ADSB.lol did not return live aircraft data.',
       };
     }
 
@@ -397,7 +453,7 @@ export class OpenSkyService {
       const headers = await this.getAuthHeaders();
       const res = await fetch(url, {
         headers,
-        signal: AbortSignal.timeout(7000),
+        signal: AbortSignal.timeout(5500),
       });
 
       // Track OpenSky credit rate limits from live headers
@@ -545,10 +601,12 @@ export class OpenSkyService {
         data: liveFlights,
         timestamp: now,
         bboxKey: bboxKey,
+        provider: 'opensky',
       };
 
       return {
         flights: liveFlights,
+        provider: 'opensky',
         creditsRemaining: this.creditsRemaining,
         dailyAllowance: this.dailyAllowance,
         isLive: true,
@@ -557,8 +615,13 @@ export class OpenSkyService {
       };
     } catch (err: any) {
       console.warn(`[OpenSky Live] Failed to fetch live OpenSky data:`, err?.message || err);
+      if (bbox) {
+        const fallbackResult = await this.fetchAdsbLolStates(bbox, now, bboxKey);
+        if (fallbackResult) return fallbackResult;
+      }
       return {
         flights: [],
+        provider: 'opensky',
         creditsRemaining: this.creditsRemaining,
         dailyAllowance: this.dailyAllowance,
         isLive: false,
@@ -566,6 +629,170 @@ export class OpenSkyService {
         lastUpdated: new Date(now).toISOString(),
         error: err?.message || 'Failed to reach OpenSky Network servers',
       };
+    }
+  }
+
+  private async fetchAdsbLolStates(
+    bbox: { lamin: number; lomin: number; lamax: number; lomax: number },
+    timestamp: number,
+    bboxKey: string,
+  ): Promise<OpenSkyLiveResponse | null> {
+    if (timestamp < this.adsbLolRetryAt) {
+      if (this.cachedResponse?.provider === 'adsb.lol' && this.cachedResponse.bboxKey === bboxKey) {
+        return {
+          flights: this.cachedResponse.data,
+          provider: 'adsb.lol',
+          creditsRemaining: this.creditsRemaining,
+          dailyAllowance: this.dailyAllowance,
+          isLive: true,
+          creditCost: 0,
+          lastUpdated: new Date(this.cachedResponse.timestamp).toISOString(),
+        };
+      }
+      return null;
+    }
+
+    const centerLat = (bbox.lamin + bbox.lamax) / 2;
+    const centerLon = (bbox.lomin + bbox.lomax) / 2;
+    const radiusNm = Math.min(
+      250,
+      Math.max(1, Math.ceil(this.calculateDistanceNm(centerLat, centerLon, bbox.lamax, bbox.lomax))),
+    );
+
+    try {
+      const response = await fetch(
+        `https://api.adsb.lol/v2/lat/${centerLat.toFixed(4)}/lon/${centerLon.toFixed(4)}/dist/${radiusNm}`,
+        { headers: { Accept: 'application/json' }, signal: AbortSignal.timeout(5000) },
+      );
+      if (response.status === 429) {
+        const retryAfterSeconds = Number(response.headers.get('retry-after'));
+        const backoffMs = Number.isFinite(retryAfterSeconds) && retryAfterSeconds > 0
+          ? retryAfterSeconds * 1000
+          : Math.min(this.adsbLolBackoffMs * 2, 5 * 60 * 1000);
+        this.adsbLolBackoffMs = backoffMs;
+        this.adsbLolRetryAt = timestamp + backoffMs;
+        console.warn(`[ADSB.lol Live] Rate limited; backing off for ${Math.ceil(backoffMs / 1000)} seconds`);
+        return null;
+      }
+      if (!response.ok) throw new Error(`ADSB.lol HTTP ${response.status}`);
+      this.adsbLolBackoffMs = 15000;
+      this.adsbLolRetryAt = 0;
+
+      const payload = await response.json();
+      const aircraft = Array.isArray(payload?.ac) ? payload.ac : [];
+      const liveFlights: Flight[] = [];
+
+      for (const state of aircraft) {
+        const lat = Number(state?.lat);
+        const lon = Number(state?.lon);
+        if (!Number.isFinite(lat) || !Number.isFinite(lon)) continue;
+        if (lat < bbox.lamin || lat > bbox.lamax || lon < bbox.lomin || lon > bbox.lomax) continue;
+        if (state.alt_baro === 'ground') continue;
+
+        const icao24 = String(state.hex || '').replace(/^~/, '').toLowerCase();
+        if (!/^[0-9a-f]{6}$/.test(icao24)) continue;
+
+        const callsign = String(state.flight || state.callsign || '').trim().toUpperCase();
+        const altitudeValue = Number(state.alt_baro);
+        const velocityValue = Number(state.gs);
+        const headingValue = Number(state.track ?? state.nav_heading);
+        const verticalRateValue = Number(state.baro_rate ?? state.geom_rate);
+        const altitudeAvailable = Number.isFinite(altitudeValue);
+        const velocityAvailable = Number.isFinite(velocityValue);
+        const trackAvailable = Number.isFinite(headingValue);
+        const verticalRateAvailable = Number.isFinite(verticalRateValue);
+        const altitude = altitudeAvailable ? Math.round(altitudeValue) : 0;
+        const velocity = velocityAvailable ? Math.round(velocityValue) : 0;
+        const heading = trackAvailable ? Math.round(headingValue) : 0;
+        const verticalRate = verticalRateAvailable ? Math.round(verticalRateValue) : 0;
+        const prefix3 = callsign.slice(0, 3);
+        const matchedAirline = MAJOR_AIRLINES.find((airline) => airline.icao === prefix3);
+        const cachedRoute = this.routeCache.get(callsign);
+        const unknownAirport: Airport = {
+          code: '—', name: 'Unknown airport', city: 'Unknown', country: '',
+          lat, lon, timezone: 'UTC',
+        };
+        const origin = cachedRoute?.origin || unknownAirport;
+        const destination = cachedRoute?.destination || unknownAirport;
+        const routeKnown = Boolean(cachedRoute);
+        const distanceToDestination = routeKnown
+          ? this.calculateDistanceNm(lat, lon, destination.lat, destination.lon)
+          : 0;
+        const distanceFromOrigin = routeKnown
+          ? this.calculateDistanceNm(origin.lat, origin.lon, lat, lon)
+          : 0;
+        const etaAvailable = routeKnown && velocity >= 100;
+        const trail = this.trailCache.get(icao24) || [];
+        const lastPoint = trail[trail.length - 1];
+        if (!lastPoint || lastPoint[0] !== lat || lastPoint[1] !== lon) {
+          trail.push([lat, lon]);
+          if (trail.length > 120) trail.shift();
+          this.trailCache.set(icao24, trail);
+        }
+        const seenSeconds = Number(state.seen);
+        const seenPositionSeconds = Number(state.seen_pos);
+        const nowSeconds = Math.floor(timestamp / 1000);
+
+        liveFlights.push({
+          id: `adsblol-${icao24}`,
+          flightNumber: callsign || icao24.toUpperCase(),
+          callsign: callsign || icao24.toUpperCase(),
+          airline: matchedAirline?.name || 'Operator unknown',
+          airlineCode: matchedAirline?.code || prefix3.slice(0, 2),
+          aircraftType: String(state.t || 'Unknown aircraft type'),
+          aircraftCategory: String(state.category || 'Unknown'),
+          registration: String(state.r || '—'),
+          origin,
+          destination,
+          latitude: lat,
+          longitude: lon,
+          altitude,
+          velocity,
+          heading,
+          verticalRate,
+          squawk: String(state.squawk || '—'),
+          status: 'unknown',
+          delayMinutes: 0,
+          departureScheduled: '',
+          departureActual: '',
+          arrivalScheduled: '',
+          arrivalEstimated: etaAvailable
+            ? this.formatUtcTime(timestamp + (distanceToDestination / velocity) * 3600000)
+            : '',
+          progressPercent: routeKnown && distanceFromOrigin + distanceToDestination > 0
+            ? Math.round((distanceFromOrigin / (distanceFromOrigin + distanceToDestination)) * 100)
+            : 0,
+          trail: [...trail],
+          dataSource: 'opensky',
+          routeKnown,
+          routeSource: routeKnown ? 'callsign_estimate' : 'unknown',
+          scheduleKnown: false,
+          etaType: etaAvailable ? 'direct_estimate' : 'unavailable',
+          icao24,
+          positionTime: Number.isFinite(seenPositionSeconds) ? nowSeconds - Math.round(seenPositionSeconds) : null,
+          lastContact: Number.isFinite(seenSeconds) ? nowSeconds - Math.round(seenSeconds) : null,
+          geoAltitude: Number.isFinite(Number(state.alt_geom)) ? Math.round(Number(state.alt_geom)) : null,
+          positionSource: 'ADS-B',
+          altitudeAvailable,
+          velocityAvailable,
+          trackAvailable,
+          verticalRateAvailable,
+        });
+      }
+
+      this.cachedResponse = { data: liveFlights, timestamp, bboxKey, provider: 'adsb.lol' };
+      return {
+        flights: liveFlights,
+        provider: 'adsb.lol',
+        creditsRemaining: this.creditsRemaining,
+        dailyAllowance: this.dailyAllowance,
+        isLive: true,
+        creditCost: 0,
+        lastUpdated: new Date(timestamp).toISOString(),
+      };
+    } catch (error: any) {
+      console.warn(`[ADSB.lol Live] Failed to fetch fallback data:`, error?.message || error);
+      return null;
     }
   }
 }

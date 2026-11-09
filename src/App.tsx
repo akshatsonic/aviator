@@ -74,6 +74,21 @@ function flightsAreEquivalent(previous: Flight[], next: Flight[]): boolean {
   return true;
 }
 
+function preserveObservedTrails(previous: Flight[], next: Flight[]): Flight[] {
+  const previousById = new Map(previous.map((flight) => [flight.id, flight]));
+  return next.map((flight) => {
+    const priorTrail = previousById.get(flight.id)?.trail || [];
+    const incomingTrail = flight.trail || [];
+    const trail = [...(incomingTrail.length > priorTrail.length ? incomingTrail : priorTrail)];
+    const currentPoint: [number, number] = [flight.latitude, flight.longitude];
+    const lastPoint = trail[trail.length - 1];
+    if (!lastPoint || lastPoint[0] !== currentPoint[0] || lastPoint[1] !== currentPoint[1]) {
+      trail.push(currentPoint);
+    }
+    return { ...flight, trail: trail.slice(-120) };
+  });
+}
+
 function boundsChangedMaterially(previous: MapBounds, next: MapBounds): boolean {
   const latitudeThreshold = Math.max((previous.lamax - previous.lamin) * 0.1, 0.05);
   const longitudeThreshold = Math.max((previous.lomax - previous.lomin) * 0.1, 0.05);
@@ -100,8 +115,10 @@ export default function App() {
   const [isLiveFeed, setIsLiveFeed] = useState(false);
   const [creditsRemaining, setCreditsRemaining] = useState(4000);
   const [dailyAllowance, setDailyAllowance] = useState(4000);
+  const [liveProvider, setLiveProvider] = useState<'opensky' | 'adsb.lol'>('opensky');
   const [prefilledQuery, setPrefilledQuery] = useState<string | undefined>(undefined);
   const [isInitialLoading, setIsInitialLoading] = useState(true);
+  const [feedError, setFeedError] = useState<string | null>(null);
   const [initialCenter, setInitialCenter] = useState<MapCenter | null>(null);
   const [locationStatus, setLocationStatus] = useState<'requesting' | 'granted' | 'fallback'>('requesting');
   const [isInitialScopeActive, setIsInitialScopeActive] = useState(true);
@@ -153,14 +170,29 @@ export default function App() {
         lomax: mapBounds.lomax.toString(),
       });
       const endpoint = isLiveFeed ? `/api/opensky/live?${boundsParams}` : `/api/flights?${boundsParams}`;
-      const res = await fetch(endpoint, { signal });
+      const timeoutSignal = AbortSignal.timeout(12000);
+      const requestSignal = signal ? AbortSignal.any([signal, timeoutSignal]) : timeoutSignal;
+      const res = await fetch(endpoint, { signal: requestSignal });
       const contentType = res.headers.get('content-type');
       if (!res.ok || !contentType || !contentType.includes('application/json')) {
+        setFeedError(`Flight feed returned HTTP ${res.status}`);
         return;
       }
       const data = await res.json();
+      if (isLiveFeed && data.isLive === false) {
+        setFeedError(data.error || 'OpenSky did not return live aircraft data');
+        return;
+      }
+
+      setFeedError(null);
+      if (data.provider === 'opensky' || data.provider === 'adsb.lol') {
+        setLiveProvider(data.provider);
+      }
       if (Array.isArray(data.flights) && (data.isLive !== false || !isLiveFeed)) {
-        setFlights((previous) => flightsAreEquivalent(previous, data.flights) ? previous : data.flights);
+        setFlights((previous) => {
+          const nextFlights = preserveObservedTrails(previous, data.flights);
+          return flightsAreEquivalent(previous, nextFlights) ? previous : nextFlights;
+        });
       }
       if (data.summary) {
         setSummary(data.summary);
@@ -173,7 +205,11 @@ export default function App() {
       }
     } catch (error) {
       if (error instanceof DOMException && error.name === 'AbortError') return;
-      // Ignore transient network glitches during server warm-up
+      setFeedError(
+        error instanceof DOMException && error.name === 'TimeoutError'
+          ? 'The live provider did not respond within 12 seconds.'
+          : error instanceof Error ? error.message : 'Unable to load the flight feed',
+      );
     } finally {
       setIsInitialLoading(false);
     }
@@ -217,7 +253,7 @@ export default function App() {
     const poll = async () => {
       await fetchFlights(controller.signal);
       if (!stopped) {
-        timer = setTimeout(poll, isLiveFeed ? 10000 : 2500);
+        timer = setTimeout(poll, isLiveFeed ? 30000 : 2500);
       }
     };
 
@@ -371,6 +407,8 @@ export default function App() {
         onTimezoneChange={handleTimezoneChange}
         isLiveFeed={isLiveFeed}
         creditsRemaining={creditsRemaining}
+        feedError={feedError}
+        liveProvider={liveProvider}
         onOpenOpenSkyModal={() => setIsOpenSkyModalOpen(true)}
       />
 
@@ -385,6 +423,11 @@ export default function App() {
             initialCenter={initialCenter}
             initialRadiusKm={INITIAL_RADIUS_KM}
             scopeLabel={locationStatus === 'granted' ? 'Within 100 km of you' : '100 km around Bengaluru'}
+            isLiveFeed={isLiveFeed}
+            liveProvider={liveProvider}
+            isLoading={isInitialLoading}
+            feedError={feedError}
+            onRetry={() => void fetchFlights()}
             timezone={timezone}
           />
         )}
@@ -397,7 +440,7 @@ export default function App() {
         )}
 
         {/* 4. Flight Telemetry HUD Panel (shown when aircraft is selected) */}
-        {selectedFlight && (
+        {selectedFlight && !isAiDrawerOpen && (
           <FlightTelemetryPanel
             flight={selectedFlight}
             onClose={() => setSelectedFlightId(null)}
@@ -412,6 +455,7 @@ export default function App() {
           isOpen={isAiDrawerOpen}
           onClose={() => setIsAiDrawerOpen(false)}
           flights={flights}
+          useLiveData={isLiveFeed}
           onFocusFlight={handleFocusFromAi}
           prefilledQuery={prefilledQuery}
           onClearPrefill={() => setPrefilledQuery(undefined)}
