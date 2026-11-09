@@ -1,5 +1,4 @@
 import express from 'express';
-import { createServer as createViteServer } from 'vite';
 import dotenv from 'dotenv';
 import path from 'path';
 import { fileURLToPath } from 'url';
@@ -14,7 +13,7 @@ const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 
 const app = express();
-const PORT = 3000;
+const PORT = Number(process.env.PORT) || 3000;
 
 app.use(express.json());
 
@@ -45,10 +44,13 @@ function parseBounds(query: express.Request['query']): { lamin: number; lomin: n
   return { lamin, lomin, lamax, lomax };
 }
 
-// Tick the dead-reckoning engine every 2.5 seconds
-setInterval(() => {
-  flightEngine.tick();
-}, 2500);
+// Long-running processes can tick continuously. Vercel Functions instead tick
+// when they receive a request because their instances scale to zero when idle.
+if (!process.env.VERCEL) {
+  setInterval(() => {
+    flightEngine.tick();
+  }, 2500);
+}
 
 // Initialize Gemini client if API key is provided
 let aiClient: GoogleGenAI | null = null;
@@ -65,6 +67,7 @@ if (process.env.GEMINI_API_KEY) {
 
 // REST Endpoint: Get live tracked flights & airspace summary
 app.get('/api/flights', (req, res) => {
+  if (process.env.VERCEL) flightEngine.tick();
   const bbox = parseBounds(req.query);
   const flights = flightEngine.getFlights().filter((flight) => !bbox || (
     flight.latitude >= bbox.lamin && flight.latitude <= bbox.lamax &&
@@ -421,6 +424,7 @@ async function startServer() {
   const isProd = process.env.NODE_ENV === 'production';
 
   if (!isProd) {
+    const { createServer: createViteServer } = await import('vite');
     const vite = await createViteServer({
       server: { middlewareMode: true },
       appType: 'spa',
@@ -438,4 +442,10 @@ async function startServer() {
   });
 }
 
-startServer();
+// Vercel imports the Express app as a function handler. Local and traditional
+// Node deployments still start the HTTP server normally.
+if (!process.env.VERCEL) {
+  void startServer();
+}
+
+export default app;
